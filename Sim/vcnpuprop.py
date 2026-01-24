@@ -1,11 +1,6 @@
 #!/usr/bin/env python3
 # sim_vcnpu_fixed_with_stats.py
-"""
-VCNPU group-synchronized tile-forwarding cycle-approx simulator
-Extended wrapper to return baseline-style metrics and optional MAC estimation
-Author: adapted/corrected for user by ChatGPT
-Date: 2026-01-18
-"""
+
 from __future__ import annotations
 import math
 import random
