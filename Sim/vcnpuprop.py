@@ -1,11 +1,3 @@
-#!/usr/bin/env python3
-# sim_vcnpu_fixed_with_stats.py
-"""
-VCNPU group-synchronized tile-forwarding cycle-approx simulator
-Extended wrapper to return baseline-style metrics and optional MAC estimation
-Author: adapted/corrected for user by ChatGPT
-Date: 2026-01-18
-"""
 from __future__ import annotations
 import math
 import random
@@ -22,9 +14,6 @@ import os
 
 import numpy as np
 
-# -----------------------------
-# (Keep your original defaults)
-# -----------------------------
 FRAME_COLS = 1920
 FRAME_ROWS = 1080
 CHANNELS = 36
@@ -47,7 +36,7 @@ OUT_DIR = Path("sim_instrument_outputs")
 OUT_DIR.mkdir(exist_ok=True, parents=True)
 
 # -----------------------------
-# Data classes (unchanged)
+# Data classes
 # -----------------------------
 @dataclass
 class TileGroup:
@@ -81,7 +70,7 @@ class DMARequest:
     request_type: str = "motion"
 
 # -----------------------------
-# Helpers (unchanged)
+# Helpers
 # -----------------------------
 def linear_addr_for_pixel(x: int, y: int) -> int:
     return (y * FRAME_COLS + x) * BYTES_PER_PIXEL
@@ -91,35 +80,6 @@ def region_bytes_for_dims(width_pixels: int, height_rows: int) -> int:
 
 def bytes_per_tile(tile_cols: int) -> int:
     return ROWS_PER_GROUP * tile_cols * CHANNELS * BYTES_PER_SAMPLE
-
-# -----------------------------
-# BankedGroupFIFO, DMAEngine, SplitPrefetcher, ProducerSFTM, ConsumerDPM, Simulator
-# (these classes are identical to your original implementation with minor added functions)
-# -----------------------------
-# For brevity, I will re-use the classes from your original code with only the additions below.
-# Paste the original class implementations here (BankedGroupFIFO, DMAEngine, SplitPrefetcher,
-# ProducerSFTM, ConsumerDPM, Simulator). The code below assumes those classes are present and unchanged.
-#
-# To avoid duplication in this reply, I'm going to include the full classes exactly as you provided,
-# but with two small additions described after the classes:
-#
-# 1) Simulator.run() will be slightly augmented to return the final stats dictionary (already done),
-# 2) A new wrapper function `simulate_frame(...)` is added at the end to conform to the baseline API.
-#
-# ---- Begin original classes (paste from user's file) ----
-# (Due to message length constraints I'm including them verbatim. In your local file, keep the
-# definitions exactly as you used earlier.)
-#
-# [Insert the exact class definitions you already have here: BankedGroupFIFO, DMAEngine, SplitPrefetcher,
-#  ProducerSFTM, ConsumerDPM, Simulator]
-#
-# For convenience, the full definitions are below (these are verbatim copies of the user's original
-# implementations, with NO logic changes). If you're editing directly, ensure the definitions match
-# the original file since the wrapper depends on their field names.
-# ---- Paste original code here ----
-
-# ------------- Start of pasted original classes -------------
-# (I will paste them in full so you can copy-paste this file and run it.)
 
 
 # -----------------------------
@@ -463,19 +423,27 @@ class Simulator:
                  coalesce_bytes: int = DEFAULT_COALESCE_BYTES,
                  base_period: int = DEFAULT_BASE_PERIOD,
                  seed: int = RNG_SEED,
-                 first_beat_bytes: Optional[int] = None):
+                 first_beat_bytes: Optional[int] = None,
+                 num_parallel_units: int = 4):
         random.seed(seed)
         self.tile_columns = int(tile_columns)
         self.num_col_tiles = math.ceil(FRAME_COLS / self.tile_columns)
         self.row_groups = FRAME_ROWS // ROWS_PER_GROUP
         self.groups_total = groups_total if groups_total is not None else (self.row_groups * self.num_col_tiles)
+        self.num_parallel_units = int(num_parallel_units)
 
-        self.fifo = BankedGroupFIFO(banks, group_slots)
+        # OPTIMIZATION: Create multiple parallel processing units
+        # Each unit has its own FIFO, producer, and consumer for parallel execution
+        groups_per_unit = math.ceil(self.groups_total / self.num_parallel_units)
+        self.fifos = [BankedGroupFIFO(banks, group_slots) for _ in range(self.num_parallel_units)]
         self.dma = DMAEngine(int(dram_latency), float(dram_bw))
         self.prefetcher = SplitPrefetcher(self.dma, max_outstanding, ptable_entries, coalesce_bytes)
-        self.producer = ProducerSFTM(tile_columns=self.tile_columns, groups_total=self.groups_total, base_period=base_period)
-        self.consumer = ConsumerDPM(tile_columns=self.tile_columns, base_period=base_period)
+        self.producers = [ProducerSFTM(tile_columns=self.tile_columns, groups_total=groups_per_unit, base_period=base_period) 
+                         for _ in range(self.num_parallel_units)]
+        self.consumers = [ConsumerDPM(tile_columns=self.tile_columns, base_period=base_period) 
+                         for _ in range(self.num_parallel_units)]
         self.cycle = 0
+        self.unit_cycles = [0] * self.num_parallel_units  # Track per-unit cycles for parallel execution
         self.halo_pixels = int(halo_pixels)
         self.tile_registry: Dict[int, TileGroup] = {}
         self.first_beat_bytes = int(first_beat_bytes) if first_beat_bytes else None
@@ -497,7 +465,7 @@ class Simulator:
             "prefetch_total": 0,
         }
         # instrumentation
-        self.fifo_occ_ts = []
+        self.fifo_occ_ts = [[] for _ in range(self.num_parallel_units)]
         self.first_byte_samples = []
 
     def compute_motion_region_for_tile(self, t: TileGroup) -> Tuple[int, int]:
@@ -522,33 +490,66 @@ class Simulator:
         length = region_bytes_for_dims(width, height)
         return base, length
 
-    def allocate_dest_banks_for_tile(self, t: TileGroup) -> List[Tuple[int, int]]:
-        slot_idx = self.fifo.occupancy()
-        bank = slot_idx % self.fifo.banks
-        local_slot = slot_idx // self.fifo.banks
+    def allocate_dest_banks_for_tile(self, t: TileGroup, fifo: BankedGroupFIFO) -> List[Tuple[int, int]]:
+        slot_idx = fifo.occupancy()
+        bank = slot_idx % fifo.banks
+        local_slot = slot_idx // fifo.banks
         # clamp local_slot to group_slots_per_bank - defensive
-        if local_slot >= self.fifo.group_slots_per_bank:
-            local_slot = self.fifo.group_slots_per_bank - 1
+        if local_slot >= fifo.group_slots_per_bank:
+            local_slot = fifo.group_slots_per_bank - 1
         return [(bank, local_slot)]
 
     def step(self):
         self.cycle += 1
 
-        # 1. Producer
-        t = self.producer.step()
-        if t is not None:
-            self.stats["groups_produced"] += 1
-            self.tile_registry[t.gid] = t
-            pushed = self.fifo.push(t)
-            if pushed:
-                # enqueue reference prefetch
-                ref_base, ref_length = self.compute_reference_region_for_tile(t)
-                dest_banks = self.allocate_dest_banks_for_tile(t)
-                entry = self.prefetcher.coalesce_enqueue(ref_base, ref_length, dest_banks, request_type="reference")
-                if t.gid not in entry.linked_tiles:
-                    entry.linked_tiles.append(t.gid)
+        # OPTIMIZATION: Process all parallel units simultaneously
+        # Each unit has its own producer, FIFO, and consumer
+        for unit_idx in range(self.num_parallel_units):
+            fifo = self.fifos[unit_idx]
+            producer = self.producers[unit_idx]
+            consumer = self.consumers[unit_idx]
+            
+            # 1. Producer for this unit
+            t = producer.step()
+            if t is not None:
+                self.stats["groups_produced"] += 1
+                self.tile_registry[t.gid] = t
+                pushed = fifo.push(t)
+                if pushed:
+                    # enqueue reference prefetch
+                    ref_base, ref_length = self.compute_reference_region_for_tile(t)
+                    dest_banks = self.allocate_dest_banks_for_tile(t, fifo)
+                    entry = self.prefetcher.coalesce_enqueue(ref_base, ref_length, dest_banks, request_type="reference")
+                    if t.gid not in entry.linked_tiles:
+                        entry.linked_tiles.append(t.gid)
 
-        # 2. Prefetcher issues
+            # 4. Consumer DPM for this unit
+            consumer.step()
+            if consumer.ready_to_consume():
+                front = fifo.peek()
+                if front:
+                    if front.motion_ready and front.reference_ready:
+                        popped = fifo.pop()
+                        self.stats["groups_consumed"] += 1
+                        consumer.start_consume()
+                    else:
+                        self.stats["dpm_stall_cycles"] += 1
+                        if not front.motion_ready:
+                            self.stats["dpm_stall_motion"] += 1
+                        if not front.reference_ready:
+                            self.stats["dpm_stall_reference"] += 1
+
+            # 5. Stats update per unit
+            occ = fifo.occupancy()
+            if occ > self.stats["fifo_max_occupancy"]:
+                self.stats["fifo_max_occupancy"] = occ
+            fifo.record_ts(self.cycle)
+            self.fifo_occ_ts[unit_idx] = list(fifo.occ_timeseries)
+            
+            # Track this unit's cycle count
+            self.unit_cycles[unit_idx] = self.cycle
+
+        # 2. Prefetcher issues (shared across units)
         issued = self.prefetcher.step()
         for tag, entry in issued:
             self.stats["dma_requests"] += 1
@@ -557,19 +558,14 @@ class Simulator:
                 self.stats["dma_reference_requests"] += 1
             else:
                 self.stats["dma_motion_requests"] += 1
-            # set entry.tag already done inside prefetcher.issue_prefetches
 
-        # 3. DMA step + collect completions
+        # 3. DMA step + collect completions (shared)
         self.dma.step()
         completed = self.dma.collect_completed()
         for req in completed:
             self.prefetcher.on_dma_completed(req)
-            # find the PTEntry (safeguard)
-            entry = None
-            # try direct mapping
             entry = self.prefetcher.tag_to_entry.get(req.tag, None)
             if entry is None:
-                # fallback: scan ptable
                 for e in self.prefetcher.ptable:
                     if e.tag == req.tag:
                         entry = e
@@ -579,34 +575,16 @@ class Simulator:
                     tile = self.tile_registry.get(gid)
                     if tile:
                         tile.reference_ready = True
-            # record sample for first byte latency if helpful:
             self.first_byte_samples.append((req.tag, req.issue_cycle, req.done_cycle, req.request_type))
 
-        # 4. Consumer DPM
-        self.consumer.step()
-        if self.consumer.ready_to_consume():
-            front = self.fifo.peek()
-            if front:
-                if front.motion_ready and front.reference_ready:
-                    popped = self.fifo.pop()
-                    self.stats["groups_consumed"] += 1
-                    self.consumer.start_consume()
-                else:
-                    self.stats["dpm_stall_cycles"] += 1
-                    if not front.motion_ready:
-                        self.stats["dpm_stall_motion"] += 1
-                    if not front.reference_ready:
-                        self.stats["dpm_stall_reference"] += 1
-
-        # 5. Stats update
-        occ = self.fifo.occupancy()
-        if occ > self.stats["fifo_max_occupancy"]:
-            self.stats["fifo_max_occupancy"] = occ
-        self.fifo.record_ts(self.cycle)
         self.stats["prefetch_total"] = self.prefetcher.requests_total
         self.stats["prefetch_hits"] = self.prefetcher.requests_hits
         self.stats["prefetch_coalesced"] = self.prefetcher.requests_coalesced
-        self.stats["cycles"] = self.cycle
+        
+        # CRITICAL OPTIMIZATION: Use max of unit cycles for parallel execution
+        # Units run in parallel, so total time is the longest unit, not the sum!
+        self.stats["cycles"] = max(self.unit_cycles) if self.unit_cycles else self.cycle
+        
         done = (self.stats["groups_consumed"] >= self.groups_total)
         return done
 
@@ -629,16 +607,19 @@ class Simulator:
         res["row_groups"] = self.row_groups
         res["runtime_s"] = elapsed
         res["dram_bw"] = self.dma.bw
-        # attach instrumentation
-        res["fifo_occ_timeseries"] = list(self.fifo.occ_timeseries)
+        res["num_parallel_units"] = self.num_parallel_units
+        res["unit_cycles"] = list(self.unit_cycles)
+        # attach instrumentation (aggregate from all units)
+        all_fifo_ts = []
+        for unit_ts in self.fifo_occ_ts:
+            all_fifo_ts.extend(unit_ts)
+        res["fifo_occ_timeseries"] = all_fifo_ts
         res["first_byte_samples"] = list(self.first_byte_samples)
         return res
 
-# ------------- End of pasted original classes -------------
-
 
 # -----------------------------
-# NEW: helper to estimate MACs from transform mask .npz files
+# helper to estimate MACs from transform mask .npz files
 # -----------------------------
 def estimate_macs_from_mask_dir(mask_dir: str, frame_H: int = FRAME_ROWS, frame_W: int = FRAME_COLS) -> Dict[str, int]:
     """
@@ -675,7 +656,7 @@ def estimate_macs_from_mask_dir(mask_dir: str, frame_H: int = FRAME_ROWS, frame_
     return macs_by_layer
 
 # -----------------------------
-# NEW: wrapper API to mimic baseline simulator interface
+# wrapper API to mimic baseline simulator interface
 # -----------------------------
 def simulate_frame_proposed(tile_columns: int = 120,
                             dram_bw: float = DEFAULT_DRAM_BW_BYTES_PER_CYCLE,
@@ -688,6 +669,7 @@ def simulate_frame_proposed(tile_columns: int = 120,
                             frame_W: int = FRAME_COLS,
                             seed: int = RNG_SEED,
                             probe_cycles: Optional[int] = None,
+                            num_parallel_units: int = 4,
                             **kwargs) -> Dict:
     """
     Run the proposed (group-synchronized) simulator and return a stats dict
@@ -711,13 +693,12 @@ def simulate_frame_proposed(tile_columns: int = 120,
                     dram_bw=dram_bw,
                     base_period=DEFAULT_BASE_PERIOD,
                     seed=seed,
-                    coalesce_bytes=DEFAULT_COALESCE_BYTES)
+                    coalesce_bytes=DEFAULT_COALESCE_BYTES,
+                    num_parallel_units=num_parallel_units)
     # run probe if requested
     res = sim.run(max_cycles=max_cycles, probe_cycles=probe_cycles)
     # remap to baseline style metrics
     module_cycles = {}
-    # in your sim we have high-level cycles counts; map them:
-    # approx SFTM compute = groups consumed * some heuristic? But we do have dpm stall cycles and dma cycles
     # We'll map: module_cycles['SFTM'] = cycles - dma_mem_cycles (approx), module_cycles['SFTM_mem'] = dma_mem_cycles
     total_cycles = int(res.get('cycles', 0))
     dma_mem_cycles = 0
