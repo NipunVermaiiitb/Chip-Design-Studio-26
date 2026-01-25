@@ -2,7 +2,7 @@ from __future__ import annotations
 import math
 import random
 import itertools
-from collections import deque
+from collections import deque, namedtuple
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 from pathlib import Path
@@ -13,6 +13,27 @@ import time
 import os
 
 import numpy as np
+
+# -------------------------
+# Config for SCU/SFTM/DPM
+# -------------------------
+class Config:
+    CLOCK_FREQ = 400e6
+    NUM_CORES = 2
+    PIF = 12
+    POF = 4
+    SCU_MULTIPLIERS = 18
+    MU_C = 4
+    MU_D = 6
+    RHO_C = 0.375
+    RHO_D = 0.50
+    ACTIVATION_BYTES = 2
+    WEIGHT_BYTES = 2
+    PRETU_LATENCY = 4
+    POSTTU_LATENCY = 4
+    SCU_PIPELINE_LATENCY = 2
+    DFCONV_INTERP_COST_PER_SAMPLE = 2
+    DFCONV_PE_COUNT = 64
 
 FRAME_COLS = 1920
 FRAME_ROWS = 1080
@@ -36,6 +57,25 @@ OUT_DIR = Path("sim_instrument_outputs")
 OUT_DIR.mkdir(exist_ok=True, parents=True)
 
 # -----------------------------
+# SCU and TileJob
+# -----------------------------
+TileJob = namedtuple('TileJob', ['layer', 'tile_idx', 'rows', 'cols', 'in_ch', 'out_ch', 'type'])
+
+class SCU:
+    def __init__(self, core_id, r, c, multipliers=Config.SCU_MULTIPLIERS):
+        self.core = core_id
+        self.r = r
+        self.c = c
+        self.multipliers = multipliers
+        self.assigned_mults = 0
+    def assign(self, n):
+        self.assigned_mults += n
+    def reset(self):
+        self.assigned_mults = 0
+    def cycles_needed(self):
+        return math.ceil(self.assigned_mults / self.multipliers) if self.assigned_mults > 0 else 0
+
+# -----------------------------
 # Data classes
 # -----------------------------
 @dataclass
@@ -47,6 +87,9 @@ class TileGroup:
     col_end: int
     motion_ready: bool = False
     reference_ready: bool = False
+    sftm_done: bool = False  # SFTM computation complete
+    sftm_cycles: int = 0  # Cycles spent in SFTM computation
+    bypass_mode: bool = False  # Use DRAM path instead of FIFO
 
 @dataclass
 class PTEntry:
@@ -341,12 +384,13 @@ class SplitPrefetcher:
         return self.issue_prefetches()
 
 # -----------------------------
-# Producer (SFTM)
+# Producer (SFTM) with actual computation
 # -----------------------------
 class ProducerSFTM:
     def __init__(self, tile_columns: int, groups_total: int = None,
-                 base_period: int = DEFAULT_BASE_PERIOD, jitter: int = 2):
+                 base_period: int = DEFAULT_BASE_PERIOD, jitter: int = 2, core_id: int = 0):
         random.seed(RNG_SEED)
+        self.core_id = core_id
         self.tile_columns = tile_columns
         self.num_col_tiles = math.ceil(FRAME_COLS / tile_columns)
         self.base_period = base_period
@@ -359,9 +403,32 @@ class ProducerSFTM:
         self.issued = 0
         self.next_issue = 1
         self.gid = 1
+        # SCU grid for computation
+        self.rows = Config.POF
+        self.cols = Config.PIF
+        self.scu_grid = [[SCU(core_id, r, c) for c in range(self.cols)] for r in range(self.rows)]
+        self.scu_counts_cache = {}  # layer_name -> counts array
+        self.sparse_maps = {}  # layer_name -> coords
+        self.active_tile = None  # Tile being processed
+        self.sftm_busy_until = 0  # Cycle when current tile finishes
 
-    def step(self) -> Optional[TileGroup]:
+    def step(self) -> Optional[Tuple[TileGroup, int, int]]:
+        """Returns (tile, sftm_cycles, macs) or None"""
         self.cycle += 1
+        
+        # Check if currently processing a tile
+        if self.active_tile and self.cycle < self.sftm_busy_until:
+            return None  # Still busy
+        
+        # Finish active tile
+        if self.active_tile:
+            finished = self.active_tile
+            finished.sftm_done = True
+            finished.motion_ready = True
+            self.active_tile = None
+            return (finished, finished.sftm_cycles, 0)  # Return completed tile
+        
+        # Issue new tile
         if self.issued >= self.groups_total:
             return None
         if self.cycle >= self.next_issue:
@@ -372,17 +439,78 @@ class ProducerSFTM:
             col_start = col_tile_idx * self.tile_columns
             col_end = min(FRAME_COLS - 1, col_start + self.tile_columns - 1)
             t = TileGroup(gid=self.gid, row_group_idx=row_group_idx,
-                          col_tile_idx=col_tile_idx, col_start=col_start, col_end=col_end,
-                          motion_ready=True)
+                          col_tile_idx=col_tile_idx, col_start=col_start, col_end=col_end)
+            # Compute actual SFTM cycles
+            sftm_cycles, macs = self.compute_sftm_cycles(t)
+            t.sftm_cycles = sftm_cycles
+            self.active_tile = t
+            self.sftm_busy_until = self.cycle + sftm_cycles
             self.gid += 1
             self.issued += 1
             jitter_v = random.randint(-self.jitter, self.jitter) if self.jitter > 0 else 0
             self.next_issue = self.cycle + max(1, self.period_per_tile + jitter_v)
-            return t
+            return None  # Will return on completion
         return None
+    
+    def load_sparse_masks(self, mask_dir: str, layer_names: List[str]):
+        """Load sparse transform masks and precompute SCU counts"""
+        if not mask_dir or not os.path.isdir(mask_dir):
+            return
+        for layer_name in layer_names:
+            fname = os.path.join(mask_dir, f"{layer_name}.npz")
+            if not os.path.exists(fname):
+                continue
+            try:
+                d = np.load(fname)
+                idx0 = d['idx0'].astype(int)
+                idx1 = d['idx1'].astype(int)
+                idx2 = d['idx2'].astype(int)
+                idx3 = d['idx3'].astype(int)
+                coords = np.stack([idx0, idx1, idx2, idx3], axis=1)
+                self.sparse_maps[layer_name] = coords
+                # Precompute SCU counts (assume 36 in/out channels)
+                out_ch = in_ch = CHANNELS
+                out_per_row = max(1, math.ceil(out_ch / self.rows))
+                in_per_col = max(1, math.ceil(in_ch / self.cols))
+                o_idx = coords[:, 0].astype(np.int64)
+                i_idx = coords[:, 1].astype(np.int64)
+                r_idx = np.minimum(self.rows - 1, o_idx // out_per_row)
+                c_idx = np.minimum(self.cols - 1, i_idx // in_per_col)
+                linear = (r_idx * self.cols) + c_idx
+                counts = np.bincount(linear, minlength=self.rows * self.cols).astype(np.int64)
+                self.scu_counts_cache[layer_name] = counts
+            except Exception as e:
+                print(f"Warning: failed to load {fname}: {e}")
+    
+    def compute_sftm_cycles(self, t: TileGroup, layer_name: str = "RFConv0") -> Tuple[int, int]:
+        """Compute SFTM processing cycles for a tile"""
+        rows = ROWS_PER_GROUP
+        cols = t.col_end - t.col_start + 1
+        out_patch_rows = max(1, math.ceil(rows / 2))
+        out_patch_cols = max(1, math.ceil(cols / 2))
+        patches = out_patch_rows * out_patch_cols
+        
+        # Use cached SCU counts if available
+        if layer_name in self.scu_counts_cache:
+            counts = self.scu_counts_cache[layer_name]
+            assigned_mults = counts * patches
+            multipliers = Config.SCU_MULTIPLIERS
+            cycles_per_scu = (assigned_mults + multipliers - 1) // multipliers
+            scu_cycles = int(cycles_per_scu.max()) if cycles_per_scu.size > 0 else 0
+            total_macs = int(assigned_mults.sum())
+        else:
+            # Fallback: analytic model
+            mu2 = Config.MU_C * Config.MU_C
+            rho = Config.RHO_C
+            total_macs = int(patches * CHANNELS * mu2 * rho)
+            mults_per_scu = total_macs // (self.rows * self.cols)
+            scu_cycles = math.ceil(mults_per_scu / Config.SCU_MULTIPLIERS)
+        
+        total_cycles = Config.PRETU_LATENCY + scu_cycles + Config.SCU_PIPELINE_LATENCY + Config.POSTTU_LATENCY
+        return total_cycles, total_macs
 
 # -----------------------------
-# Consumer (DPM)
+# Consumer (DPM) with actual deformable convolution
 # -----------------------------
 class ConsumerDPM:
     def __init__(self, tile_columns: int, base_period: int = DEFAULT_BASE_PERIOD, jitter: int = 4):
@@ -395,17 +523,37 @@ class ConsumerDPM:
         self.next_consume = 1
         self.stall_cycles = 0
         self.consumed = 0
+        self.active_tile = None
+        self.dpm_busy_until = 0
+
+    def compute_dpm_cycles(self, t: TileGroup) -> Tuple[int, int]:
+        """Compute DPM (deformable convolution) processing cycles"""
+        rows = ROWS_PER_GROUP
+        cols = t.col_end - t.col_start + 1
+        out_pixels = rows * cols
+        # DfConv: interpolation + MAC operations
+        interp_cycles = out_pixels * Config.DFCONV_INTERP_COST_PER_SAMPLE
+        macs = out_pixels * CHANNELS * 9 * CHANNELS // 4  # 3x3 kernel, 1/4 subsampling
+        mac_cycles = math.ceil(macs / Config.DFCONV_PE_COUNT)
+        total_cycles = interp_cycles + mac_cycles
+        return total_cycles, macs
 
     def step(self):
         self.cycle += 1
 
     def ready_to_consume(self):
-        return self.cycle >= self.next_consume
+        # Ready if not busy and past the next consume cycle
+        return self.cycle >= self.next_consume and self.cycle >= self.dpm_busy_until
 
-    def start_consume(self):
+    def start_consume(self, t: TileGroup) -> Tuple[int, int]:
+        """Start consuming a tile, returns (dpm_cycles, macs)"""
+        dpm_cycles, macs = self.compute_dpm_cycles(t)
+        self.active_tile = t
+        self.dpm_busy_until = self.cycle + dpm_cycles
         jitter_v = random.randint(-self.jitter, self.jitter) if self.jitter > 0 else 0
         self.next_consume = self.cycle + max(1, self.period_per_tile + jitter_v)
         self.consumed += 1
+        return dpm_cycles, macs
 
 # -----------------------------
 # Simulator (unchanged behavior, returns res dict)
@@ -424,13 +572,16 @@ class Simulator:
                  base_period: int = DEFAULT_BASE_PERIOD,
                  seed: int = RNG_SEED,
                  first_beat_bytes: Optional[int] = None,
-                 num_parallel_units: int = 4):
+                 num_parallel_units: int = 4,
+                 bypass_mode: bool = False,
+                 mask_dir: Optional[str] = None):
         random.seed(seed)
         self.tile_columns = int(tile_columns)
         self.num_col_tiles = math.ceil(FRAME_COLS / self.tile_columns)
         self.row_groups = FRAME_ROWS // ROWS_PER_GROUP
         self.groups_total = groups_total if groups_total is not None else (self.row_groups * self.num_col_tiles)
         self.num_parallel_units = int(num_parallel_units)
+        self.bypass_mode = bypass_mode
 
         # OPTIMIZATION: Create multiple parallel processing units
         # Each unit has its own FIFO, producer, and consumer for parallel execution
@@ -438,8 +589,9 @@ class Simulator:
         self.fifos = [BankedGroupFIFO(banks, group_slots) for _ in range(self.num_parallel_units)]
         self.dma = DMAEngine(int(dram_latency), float(dram_bw))
         self.prefetcher = SplitPrefetcher(self.dma, max_outstanding, ptable_entries, coalesce_bytes)
-        self.producers = [ProducerSFTM(tile_columns=self.tile_columns, groups_total=groups_per_unit, base_period=base_period) 
-                         for _ in range(self.num_parallel_units)]
+        self.producers = [ProducerSFTM(tile_columns=self.tile_columns, groups_total=groups_per_unit, 
+                                       base_period=base_period, core_id=i) 
+                         for i in range(self.num_parallel_units)]
         self.consumers = [ConsumerDPM(tile_columns=self.tile_columns, base_period=base_period) 
                          for _ in range(self.num_parallel_units)]
         self.cycle = 0
@@ -447,6 +599,12 @@ class Simulator:
         self.halo_pixels = int(halo_pixels)
         self.tile_registry: Dict[int, TileGroup] = {}
         self.first_beat_bytes = int(first_beat_bytes) if first_beat_bytes else None
+        
+        # Load sparse masks if provided
+        if mask_dir:
+            layer_names = ["RFConv0", "RFConv1", "RFDeConv0", "RFConv2", "RFConv3", "RFDeConv1"]
+            for producer in self.producers:
+                producer.load_sparse_masks(mask_dir, layer_names)
 
         self.stats = {
             "cycles": 0,
@@ -463,6 +621,11 @@ class Simulator:
             "prefetch_hits": 0,
             "prefetch_coalesced": 0,
             "prefetch_total": 0,
+            "sftm_compute_cycles": 0,
+            "dpm_compute_cycles": 0,
+            "sftm_macs": 0,
+            "dpm_macs": 0,
+            "bypass_mode_used": 0,
         }
         # instrumentation
         self.fifo_occ_ts = [[] for _ in range(self.num_parallel_units)]
@@ -509,21 +672,31 @@ class Simulator:
             producer = self.producers[unit_idx]
             consumer = self.consumers[unit_idx]
             
-            # 1. Producer for this unit
-            t = producer.step()
-            if t is not None:
+            # 1. Producer SFTM for this unit (with actual computation)
+            result = producer.step()
+            if result is not None:
+                t, sftm_cycles, macs = result
                 self.stats["groups_produced"] += 1
+                self.stats["sftm_compute_cycles"] += sftm_cycles
+                self.stats["sftm_macs"] += macs
                 self.tile_registry[t.gid] = t
-                pushed = fifo.push(t)
-                if pushed:
-                    # enqueue reference prefetch
-                    ref_base, ref_length = self.compute_reference_region_for_tile(t)
-                    dest_banks = self.allocate_dest_banks_for_tile(t, fifo)
-                    entry = self.prefetcher.coalesce_enqueue(ref_base, ref_length, dest_banks, request_type="reference")
-                    if t.gid not in entry.linked_tiles:
-                        entry.linked_tiles.append(t.gid)
+                
+                # Bypass mode check
+                if self.bypass_mode or not fifo.can_push():
+                    # Use DRAM scatter-gather path (baseline behavior)
+                    t.bypass_mode = True
+                    self.stats["bypass_mode_used"] += 1
+                else:
+                    pushed = fifo.push(t)
+                    if pushed:
+                        # enqueue reference prefetch
+                        ref_base, ref_length = self.compute_reference_region_for_tile(t)
+                        dest_banks = self.allocate_dest_banks_for_tile(t, fifo)
+                        entry = self.prefetcher.coalesce_enqueue(ref_base, ref_length, dest_banks, request_type="reference")
+                        if t.gid not in entry.linked_tiles:
+                            entry.linked_tiles.append(t.gid)
 
-            # 4. Consumer DPM for this unit
+            # 4. Consumer DPM for this unit (with actual computation)
             consumer.step()
             if consumer.ready_to_consume():
                 front = fifo.peek()
@@ -531,7 +704,10 @@ class Simulator:
                     if front.motion_ready and front.reference_ready:
                         popped = fifo.pop()
                         self.stats["groups_consumed"] += 1
-                        consumer.start_consume()
+                        # Compute actual DPM cycles
+                        dpm_cycles, dpm_macs = consumer.start_consume(popped)
+                        self.stats["dpm_compute_cycles"] += dpm_cycles
+                        self.stats["dpm_macs"] += dpm_macs
                     else:
                         self.stats["dpm_stall_cycles"] += 1
                         if not front.motion_ready:
@@ -601,7 +777,8 @@ class Simulator:
         elapsed = time.time() - start_time
         res = dict(self.stats)
         res["dma_outstanding_at_end"] = self.dma.outstanding_count()
-        res["fifo_overflow_count"] = self.fifo.overflow_count
+        # Sum overflow counts from all FIFOs
+        res["fifo_overflow_count"] = sum(fifo.overflow_count for fifo in self.fifos)
         res["tile_columns"] = self.tile_columns
         res["num_col_tiles"] = self.num_col_tiles
         res["row_groups"] = self.row_groups
@@ -686,6 +863,7 @@ def simulate_frame_proposed(tile_columns: int = 120,
       - 'runtime_s' (float)
       - plus raw sim stats returned under 'raw'
     """
+    bypass = kwargs.get('bypass_mode', False)
     sim = Simulator(tile_columns=tile_columns,
                     banks=banks,
                     group_slots=group_slots,
@@ -694,22 +872,31 @@ def simulate_frame_proposed(tile_columns: int = 120,
                     base_period=DEFAULT_BASE_PERIOD,
                     seed=seed,
                     coalesce_bytes=DEFAULT_COALESCE_BYTES,
-                    num_parallel_units=num_parallel_units)
+                    num_parallel_units=num_parallel_units,
+                    bypass_mode=bypass,
+                    mask_dir=mask_dir)
     # run probe if requested
     res = sim.run(max_cycles=max_cycles, probe_cycles=probe_cycles)
     # remap to baseline style metrics
     module_cycles = {}
-    # We'll map: module_cycles['SFTM'] = cycles - dma_mem_cycles (approx), module_cycles['SFTM_mem'] = dma_mem_cycles
     total_cycles = int(res.get('cycles', 0))
+    # Use actual computed cycles from SFTM and DPM
+    module_cycles['SFTM'] = int(res.get('sftm_compute_cycles', 0))
+    module_cycles['DPM'] = int(res.get('dpm_compute_cycles', 0))
+    # estimate dma_mem_cycles based on bytes and dram bw
     dma_mem_cycles = 0
-    # estimate dma_mem_cycles based on bytes and dram bw (cycles = ceil(bytes / bytes_per_cycle))
     if 'dram_bw' in res and res['dram_bw'] > 0:
         bytes_per_cycle = res['dram_bw']
         dma_mem_cycles = int(math.ceil(res.get('dma_bytes', 0) / max(1.0, bytes_per_cycle)))
-    module_cycles['SFTM'] = max(0, total_cycles - dma_mem_cycles)
     module_cycles['SFTM_mem'] = dma_mem_cycles
-    # pack mac counts estimate if possible
-    mac_counts = estimate_macs_from_mask_dir(mask_dir, frame_H=frame_H, frame_W=frame_W) if mask_dir else None
+    # Use actual MAC counts from simulation
+    sftm_macs = int(res.get('sftm_macs', 0))
+    dpm_macs = int(res.get('dpm_macs', 0))
+    mac_counts = {
+        'SFTM': sftm_macs,
+        'DPM': dpm_macs,
+        'total': sftm_macs + dpm_macs
+    } if (sftm_macs > 0 or dpm_macs > 0) else estimate_macs_from_mask_dir(mask_dir, frame_H=frame_H, frame_W=frame_W)
     # build fifo stats
     occ_ts = res.get('fifo_occ_timeseries', [])
     occ_vals = [v for (_, v) in occ_ts] if occ_ts else []
@@ -745,6 +932,8 @@ def main_cli():
     parser.add_argument("--group_slots", type=int, default=DEFAULT_GROUP_SLOTS)
     parser.add_argument("--mask_dir", type=str, default=None, help="Directory with transform mask .npz files for MAC estimation")
     parser.add_argument("--probe_cycles", type=int, default=None)
+    parser.add_argument("--bypass_mode", action="store_true", help="Use DRAM scatter-gather path instead of FIFO")
+    parser.add_argument("--num_parallel_units", type=int, default=4, help="Number of parallel processing units")
     args = parser.parse_args()
     stats = simulate_frame_proposed(tile_columns=args.tile_columns,
                                     dram_bw=args.dram_bw,
@@ -753,16 +942,24 @@ def main_cli():
                                     banks=args.banks,
                                     group_slots=args.group_slots,
                                     mask_dir=args.mask_dir,
-                                    probe_cycles=args.probe_cycles)
+                                    probe_cycles=args.probe_cycles,
+                                    num_parallel_units=args.num_parallel_units,
+                                    bypass_mode=args.bypass_mode)
     # print top-level summary (compact)
     print("=== PROPOSED SIM SUMMARY ===")
     print(f"Simulated cycles: {stats['cycles']}")
     mc = stats['mac_counts']
     if mc:
-        print(f"Total MACs (estimate): {mc.get('total', 'N/A'):,}")
+        print(f"Total MACs: {mc.get('total', 'N/A'):,}")
+        if 'SFTM' in mc and 'DPM' in mc:
+            print(f"  SFTM MACs: {mc['SFTM']:,}")
+            print(f"  DPM MACs: {mc['DPM']:,}")
     else:
         print("MACs: N/A (no mask_dir provided)")
     print(f"Module cycles: {stats['module_cycles']}")
+    raw = stats.get('raw', {})
+    if 'bypass_mode_used' in raw and raw['bypass_mode_used'] > 0:
+        print(f"Bypass mode: Used for {raw['bypass_mode_used']} tiles (FIFO full)")
     print(f"Off-chip bytes (DRAM reads): {stats['bytes_read_offchip']}")
     print(f"FIFO stats: max_occ={stats['fifo_stats']['max_occ']} overflow={stats['fifo_stats']['overflow_count']}")
     # save json summary
