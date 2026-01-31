@@ -25,11 +25,21 @@ module sbilinear #(
     logic signed [DATA_W+SHW:0] sum;
     logic signed [DATA_W+SHW:0] sum_next;
 
+    logic [$clog2(DATA_W+1)-1:0] s0_c, s1_c, s2_c, s3_c;
+
     always_comb begin
-        sum_next = ($signed(v00) >>> s0)
-                 + ($signed(v01) >>> s1)
-                 + ($signed(v10) >>> s2)
-                 + ($signed(v11) >>> s3);
+        // Clamp shift to [0..DATA_W-1]
+        s0_c = (s0 >= DATA_W) ? (DATA_W-1) : s0[$clog2(DATA_W+1)-1:0];
+        s1_c = (s1 >= DATA_W) ? (DATA_W-1) : s1[$clog2(DATA_W+1)-1:0];
+        s2_c = (s2 >= DATA_W) ? (DATA_W-1) : s2[$clog2(DATA_W+1)-1:0];
+        s3_c = (s3 >= DATA_W) ? (DATA_W-1) : s3[$clog2(DATA_W+1)-1:0];
+    end
+
+    always_comb begin
+        sum_next = ($signed(v00) >>> s0_c)
+                 + ($signed(v01) >>> s1_c)
+                 + ($signed(v10) >>> s2_c)
+                 + ($signed(v11) >>> s3_c);
     end
 
     always_ff @(posedge clk or negedge rst_n) begin

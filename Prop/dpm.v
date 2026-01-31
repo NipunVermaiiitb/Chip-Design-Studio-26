@@ -3,6 +3,11 @@
 // Consumes FIFO data (transformed features) and reference pixels to compute output
 // Implements a paper-structured (Fig.6/Fig.7-style) datapath: RA ping-pong buffers,
 // address converter, coefficient generator, shift quantizer, and a shift-add SBCU.
+//
+// Offsets (fifo stream) expectation:
+// - offset_x/offset_y are signed fixed-point with FRAC_BITS fractional bits.
+// - Integer part P[i] = offset >>> FRAC_BITS drives the address converter.
+// - Fractional part Q[i] = offset[FRAC_BITS-1:0] drives coeff_gen + shift quantizer.
 
 `timescale 1ns/1ps
 module dpm #(
@@ -100,7 +105,7 @@ wire signed [DATA_W-1:0] ra_v01 = ra_v01_u;
 wire signed [DATA_W-1:0] ra_v10 = ra_v10_u;
 wire signed [DATA_W-1:0] ra_v11 = ra_v11_u;
 
-// Address conversion and coefficient/shift path for current kernel tap
+// Address conversion and coefficient path for current kernel tap
 wire [3:0] base_x0_w = {2'b00, pixel_cnt[1:0]} + kernel_j[3:0];
 wire [3:0] base_y0_w = {2'b00, pixel_cnt[3:2]} + kernel_i[3:0];
 wire signed [DATA_W-1:0] off_x_cur = offset_x[kernel_i][kernel_j];
@@ -132,35 +137,17 @@ wire [REF_ADDR_W-1:0] ra_addr01_w = (base_y_clipped * REF_BUF_SIZE) + (base_x_cl
 wire [REF_ADDR_W-1:0] ra_addr10_w = ((base_y_clipped + 1'b1) * REF_BUF_SIZE) + base_x_clipped;
 wire [REF_ADDR_W-1:0] ra_addr11_w = ((base_y_clipped + 1'b1) * REF_BUF_SIZE) + (base_x_clipped + 1'b1);
 
-wire [FRAC_BITS:0] c00, c01, c10, c11;
-coeff_generator_paper #(
-    .FRAC_BITS(FRAC_BITS),
-    .OUT_W(FRAC_BITS+1)
-) u_coeff (
-    .frac_x(frac_x),
-    .frac_y(frac_y),
-    .c00(c00),
-    .c01(c01),
-    .c10(c10),
-    .c11(c11)
-);
-
-wire [SB_SHIFT_W-1:0] s0, s1, s2, s3;
-shift_quantizer_paper #(
-    .FRAC_BITS(FRAC_BITS),
-    .SHW(SB_SHIFT_W)
-) u_qtz (
-    .c00(c00), .c01(c01), .c10(c10), .c11(c11),
-    .s0(s0), .s1(s1), .s2(s2), .s3(s3)
-);
-
 reg sb_valid_in;
 wire sb_valid_out;
 wire signed [DATA_W-1:0] sb_out;
 
-sbilinear #(
+// Bit-exact SBilinear per Algorithm 1 (N=2, M=15)
+sbilinear_algo1 #(
     .DATA_W(DATA_W),
-    .SHW(SB_SHIFT_W)
+    .FRAC_BITS(FRAC_BITS),
+    .ACC_W(ACC_W),
+    .N(2),
+    .M(15)
 ) u_sb (
     .clk(clk),
     .rst_n(rst_n),
@@ -169,7 +156,8 @@ sbilinear #(
     .v01(ra_v01),
     .v10(ra_v10),
     .v11(ra_v11),
-    .s0(s0), .s1(s1), .s2(s2), .s3(s3),
+    .frac_x(frac_x),
+    .frac_y(frac_y),
     .out(sb_out),
     .valid_out(sb_valid_out)
 );
