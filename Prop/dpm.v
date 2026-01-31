@@ -1,7 +1,8 @@
 // dpm.v
 // DPM: Deformable Processing Module - performs deformable convolution
 // Consumes FIFO data (transformed features) and reference pixels to compute output
-// Implements bilinear interpolation for deformable sampling
+// Implements a paper-structured (Fig.6/Fig.7-style) datapath: RA ping-pong buffers,
+// address converter, coefficient generator, shift quantizer, and a shift-add SBCU.
 
 `timescale 1ns/1ps
 module dpm #(
@@ -10,7 +11,9 @@ module dpm #(
     parameter N_CH = 36,
     parameter GROUP_ROWS = 4,
     parameter KERNEL_SIZE = 3,
-    parameter REF_BUF_SIZE = 16  // Reference frame buffer size
+    parameter REF_BUF_SIZE = 16,  // Reference frame buffer size
+    parameter FRAC_BITS = 8,
+    parameter SB_SHIFT_W = 6
 )(
     input wire clk,
     input wire rst_n,
@@ -51,27 +54,128 @@ reg [3:0] pixel_cnt;
 reg signed [DATA_W-1:0] feature_buffer [0:GROUP_ROWS-1][0:GROUP_ROWS-1];
 reg signed [DATA_W-1:0] offset_x [0:KERNEL_SIZE-1][0:KERNEL_SIZE-1];
 reg signed [DATA_W-1:0] offset_y [0:KERNEL_SIZE-1][0:KERNEL_SIZE-1];
-reg signed [DATA_W-1:0] ref_buffer [0:REF_BUF_SIZE-1][0:REF_BUF_SIZE-1];
 
 // Deformable convolution computation signals
 reg signed [ACC_W-1:0] accumulator;
 reg [3:0] kernel_i, kernel_j;
 reg [4:0] compute_cnt;
 
-// Bilinear interpolation function (simplified fixed-point)
-function signed [DATA_W-1:0] bilinear_interp;
-    input signed [DATA_W-1:0] p00, p01, p10, p11;  // Four neighboring pixels
-    input signed [7:0] fx, fy;  // Fractional parts (0-255)
-    reg signed [ACC_W-1:0] temp1, temp2, result;
-begin
-    // Interpolate in x direction
-    temp1 = (p00 * (256 - fx) + p01 * fx) >>> 8;
-    temp2 = (p10 * (256 - fx) + p11 * fx) >>> 8;
-    // Interpolate in y direction
-    result = (temp1 * (256 - fy) + temp2 * fy) >>> 8;
-    bilinear_interp = result[DATA_W-1:0];
-end
-endfunction
+// ===== Paper-structured sub-blocks =====
+// RA ping-pong (tile buffer)
+localparam integer REF_WORDS = (REF_BUF_SIZE*REF_BUF_SIZE);
+localparam integer REF_ADDR_W = $clog2(REF_WORDS);
+
+reg ra_start_fill;
+reg ra_wr_en;
+reg [REF_ADDR_W-1:0] ra_wr_addr;
+reg [DATA_W-1:0] ra_wr_data;
+
+wire ra_rd_bank_sel;
+wire [DATA_W-1:0] ra_v00_u, ra_v01_u, ra_v10_u, ra_v11_u;
+
+ra_pingpong #(
+    .DATA_W(DATA_W),
+    .W(REF_BUF_SIZE),
+    .H(REF_BUF_SIZE)
+) u_ra (
+    .clk(clk),
+    .rst_n(rst_n),
+    .start_fill(ra_start_fill),
+    .wr_en(ra_wr_en),
+    .wr_addr(ra_wr_addr),
+    .wr_data(ra_wr_data),
+    .rd_bank_sel(ra_rd_bank_sel),
+    .rd_addr0(ra_addr00_w),
+    .rd_addr1(ra_addr01_w),
+    .rd_addr2(ra_addr10_w),
+    .rd_addr3(ra_addr11_w),
+    .rd_data0(ra_v00_u),
+    .rd_data1(ra_v01_u),
+    .rd_data2(ra_v10_u),
+    .rd_data3(ra_v11_u)
+);
+
+wire signed [DATA_W-1:0] ra_v00 = ra_v00_u;
+wire signed [DATA_W-1:0] ra_v01 = ra_v01_u;
+wire signed [DATA_W-1:0] ra_v10 = ra_v10_u;
+wire signed [DATA_W-1:0] ra_v11 = ra_v11_u;
+
+// Address conversion and coefficient/shift path for current kernel tap
+wire [3:0] base_x0_w = {2'b00, pixel_cnt[1:0]} + kernel_j[3:0];
+wire [3:0] base_y0_w = {2'b00, pixel_cnt[3:2]} + kernel_i[3:0];
+wire signed [DATA_W-1:0] off_x_cur = offset_x[kernel_i][kernel_j];
+wire signed [DATA_W-1:0] off_y_cur = offset_y[kernel_i][kernel_j];
+
+wire [3:0] base_x_clipped, base_y_clipped;
+wire [FRAC_BITS-1:0] frac_x, frac_y;
+
+addr_conv_paper #(
+    .DATA_W(DATA_W),
+    .FRAC_BITS(FRAC_BITS),
+    .IDX_W(4),
+    .MAX_X(REF_BUF_SIZE),
+    .MAX_Y(REF_BUF_SIZE)
+) u_addr (
+    .off_x(off_x_cur),
+    .off_y(off_y_cur),
+    .base_x0(base_x0_w),
+    .base_y0(base_y0_w),
+    .base_x(base_x_clipped),
+    .base_y(base_y_clipped),
+    .frac_x(frac_x),
+    .frac_y(frac_y)
+);
+
+// Neighbor addresses in the RA tile buffer
+wire [REF_ADDR_W-1:0] ra_addr00_w = (base_y_clipped * REF_BUF_SIZE) + base_x_clipped;
+wire [REF_ADDR_W-1:0] ra_addr01_w = (base_y_clipped * REF_BUF_SIZE) + (base_x_clipped + 1'b1);
+wire [REF_ADDR_W-1:0] ra_addr10_w = ((base_y_clipped + 1'b1) * REF_BUF_SIZE) + base_x_clipped;
+wire [REF_ADDR_W-1:0] ra_addr11_w = ((base_y_clipped + 1'b1) * REF_BUF_SIZE) + (base_x_clipped + 1'b1);
+
+wire [FRAC_BITS:0] c00, c01, c10, c11;
+coeff_generator_paper #(
+    .FRAC_BITS(FRAC_BITS),
+    .OUT_W(FRAC_BITS+1)
+) u_coeff (
+    .frac_x(frac_x),
+    .frac_y(frac_y),
+    .c00(c00),
+    .c01(c01),
+    .c10(c10),
+    .c11(c11)
+);
+
+wire [SB_SHIFT_W-1:0] s0, s1, s2, s3;
+shift_quantizer_paper #(
+    .FRAC_BITS(FRAC_BITS),
+    .SHW(SB_SHIFT_W)
+) u_qtz (
+    .c00(c00), .c01(c01), .c10(c10), .c11(c11),
+    .s0(s0), .s1(s1), .s2(s2), .s3(s3)
+);
+
+reg sb_valid_in;
+wire sb_valid_out;
+wire signed [DATA_W-1:0] sb_out;
+
+sbilinear #(
+    .DATA_W(DATA_W),
+    .SHW(SB_SHIFT_W)
+) u_sb (
+    .clk(clk),
+    .rst_n(rst_n),
+    .valid_in(sb_valid_in),
+    .v00(ra_v00),
+    .v01(ra_v01),
+    .v10(ra_v10),
+    .v11(ra_v11),
+    .s0(s0), .s1(s1), .s2(s2), .s3(s3),
+    .out(sb_out),
+    .valid_out(sb_valid_out)
+);
+
+reg sb_waiting;
+reg signed [DATA_W-1:0] feature_mul_reg;
 
 // Main FSM
 integer i, j;
@@ -87,6 +191,14 @@ always @(posedge clk or negedge rst_n) begin
         kernel_i <= 0;
         kernel_j <= 0;
         compute_cnt <= 0;
+
+        ra_start_fill <= 0;
+        ra_wr_en <= 0;
+        ra_wr_addr <= 0;
+        ra_wr_data <= 0;
+        sb_valid_in <= 0;
+        sb_waiting <= 0;
+        feature_mul_reg <= 0;
         
         // Clear buffers
         for (i = 0; i < GROUP_ROWS; i = i + 1)
@@ -101,6 +213,9 @@ always @(posedge clk or negedge rst_n) begin
             
     end else begin
         dpm_out_valid <= 1'b0;
+        sb_valid_in <= 1'b0;
+        ra_wr_en <= 1'b0;
+        ra_start_fill <= 1'b0;
         
         case (state)
             IDLE: begin
@@ -150,70 +265,62 @@ always @(posedge clk or negedge rst_n) begin
             end
             
             READ_REF: begin
-                // Read reference pixels (prefetched by split_prefetcher)
+                // Read reference pixels (prefetched by split_prefetcher) into RA ping-pong
+                // Start a new fill on entry to this state.
+                if (cnt == 0) begin
+                    ra_start_fill <= 1'b1;
+                    ra_wr_addr <= 0;
+                end
+
                 if (ref_data_valid) begin
-                    ref_buffer[cnt[3:0] / REF_BUF_SIZE][cnt[3:0] % REF_BUF_SIZE] <= ref_data;
+                    ra_wr_en <= 1'b1;
+                    ra_wr_data <= ref_data;
+                    ra_wr_addr <= ra_wr_addr + 1'b1;
                     cnt <= cnt + 1;
-                    if (cnt == (REF_BUF_SIZE * REF_BUF_SIZE - 1)) begin
+
+                    if (cnt == (REF_WORDS - 1)) begin
                         state <= COMPUTE_DEFORM;
                         cnt <= 0;
                         accumulator <= 0;
                         kernel_i <= 0;
                         kernel_j <= 0;
                         compute_cnt <= 0;
+                        sb_waiting <= 1'b0;
                     end
                 end
             end
             
             COMPUTE_DEFORM: begin
-                // Perform deformable convolution computation
-                // For each kernel position, apply offset and perform bilinear interpolation
-                if (compute_cnt < KERNEL_SIZE * KERNEL_SIZE) begin
-                    // Calculate sampling position with offset
-                    reg signed [DATA_W-1:0] sample_x, sample_y;
-                    reg [3:0] base_x, base_y;
-                    reg [7:0] frac_x, frac_y;
-                    reg signed [DATA_W-1:0] p00, p01, p10, p11;
-                    reg signed [DATA_W-1:0] sampled_val;
-                    
-                    sample_x = pixel_cnt[1:0] + kernel_j + offset_x[kernel_i][kernel_j];
-                    sample_y = pixel_cnt[3:2] + kernel_i + offset_y[kernel_i][kernel_j];
-                    
-                    // Extract integer and fractional parts
-                    base_x = sample_x[DATA_W-1:8];
-                    base_y = sample_y[DATA_W-1:8];
-                    frac_x = sample_x[7:0];
-                    frac_y = sample_y[7:0];
-                    
-                    // Bounds checking
-                    if (base_x < REF_BUF_SIZE-1 && base_y < REF_BUF_SIZE-1) begin
-                        // Fetch 4 neighboring pixels
-                        p00 = ref_buffer[base_y][base_x];
-                        p01 = ref_buffer[base_y][base_x+1];
-                        p10 = ref_buffer[base_y+1][base_x];
-                        p11 = ref_buffer[base_y+1][base_x+1];
-                        
-                        // Bilinear interpolation
-                        sampled_val = bilinear_interp(p00, p01, p10, p11, frac_x, frac_y);
-                        
-                        // Accumulate with feature
-                        accumulator <= accumulator + (sampled_val * feature_buffer[kernel_i][kernel_j]);
-                    end
-                    
-                    // Move to next kernel position
-                    if (kernel_j == KERNEL_SIZE-1) begin
-                        kernel_j <= 0;
-                        if (kernel_i == KERNEL_SIZE-1) begin
-                            kernel_i <= 0;
-                            state <= OUTPUT;
+                // Sequential kernel-tap scheduling, 1-cycle SBCU latency.
+                if (compute_cnt < (KERNEL_SIZE * KERNEL_SIZE)) begin
+                    if (!sb_waiting) begin
+                        // Launch SBCU for current tap
+                        feature_mul_reg <= feature_buffer[kernel_i][kernel_j];
+                        sb_valid_in <= 1'b1;
+                        sb_waiting <= 1'b1;
+                    end else if (sb_valid_out) begin
+                        // Consume SBCU output and accumulate
+                        accumulator <= accumulator + ($signed(sb_out) * $signed(feature_mul_reg));
+
+                        // Advance kernel tap
+                        if (kernel_j == KERNEL_SIZE-1) begin
+                            kernel_j <= 0;
+                            if (kernel_i == KERNEL_SIZE-1) begin
+                                kernel_i <= 0;
+                            end else begin
+                                kernel_i <= kernel_i + 1;
+                            end
                         end else begin
-                            kernel_i <= kernel_i + 1;
+                            kernel_j <= kernel_j + 1;
                         end
-                    end else begin
-                        kernel_j <= kernel_j + 1;
+
+                        compute_cnt <= compute_cnt + 1;
+                        sb_waiting <= 1'b0;
+
+                        if (compute_cnt == (KERNEL_SIZE * KERNEL_SIZE - 1)) begin
+                            state <= OUTPUT;
+                        end
                     end
-                    
-                    compute_cnt <= compute_cnt + 1;
                 end
             end
             
@@ -232,6 +339,7 @@ always @(posedge clk or negedge rst_n) begin
                     kernel_i <= 0;
                     kernel_j <= 0;
                     compute_cnt <= 0;
+                    sb_waiting <= 1'b0;
                 end
             end
             
