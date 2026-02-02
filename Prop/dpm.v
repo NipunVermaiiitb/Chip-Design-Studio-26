@@ -1,13 +1,14 @@
 // dpm.v
-// DPM: Deformable Processing Module - performs deformable convolution
-// Consumes FIFO data (transformed features) and reference pixels to compute output
+// DPM: Deformable Prediction Module - performs deformable sampling (motion compensation)
+// Consumes FIFO motion vectors (dx,dy per pixel) and reference pixels to compute output
 // Implements a paper-structured (Fig.6/Fig.7-style) datapath: RA ping-pong buffers,
 // address converter, coefficient generator, shift quantizer, and a shift-add SBCU.
 //
-// Offsets (fifo stream) expectation:
-// - offset_x/offset_y are signed fixed-point with FRAC_BITS fractional bits.
-// - Integer part P[i] = offset >>> FRAC_BITS drives the address converter.
-// - Fractional part Q[i] = offset[FRAC_BITS-1:0] drives coeff_gen + shift quantizer.
+// FIFO stream expectation (deconv/deformable mode):
+// - A 4x4 tile of dx offsets (16 words), then a 4x4 tile of dy offsets (16 words).
+// - Offsets are signed fixed-point with FRAC_BITS fractional bits.
+// - Integer part: offset >>> FRAC_BITS drives base address shift.
+// - Fractional part: offset[FRAC_BITS-1:0] drives bilinear interpolation.
 
 `timescale 1ns/1ps
 module dpm #(
@@ -40,30 +41,24 @@ module dpm #(
     output reg [DATA_W-1:0] dpm_out,
     output reg dpm_out_valid
 );
+        // Tooling note: avoid slicing an arithmetic expression like (cnt-const)[3:2].
+        wire [5:0] cnt_dy = cnt - (GROUP_ROWS * GROUP_ROWS);
 
 // States
 typedef enum reg [2:0] {
-    IDLE = 0, 
-    READ_FEATURES = 1, 
-    READ_OFFSETS = 2,
-    READ_REF = 3,
-    COMPUTE_DEFORM = 4,
-    OUTPUT = 5
+    IDLE = 0,
+    READ_OFFSETS = 1,
+    READ_REF = 2,
+    SAMPLE = 3
 } state_t;
 
 state_t state;
-reg [4:0] cnt;
+reg [5:0] cnt;
 reg [3:0] pixel_cnt;
 
-// Internal buffers
-reg signed [DATA_W-1:0] feature_buffer [0:GROUP_ROWS-1][0:GROUP_ROWS-1];
-reg signed [DATA_W-1:0] offset_x [0:KERNEL_SIZE-1][0:KERNEL_SIZE-1];
-reg signed [DATA_W-1:0] offset_y [0:KERNEL_SIZE-1][0:KERNEL_SIZE-1];
-
-// Deformable convolution computation signals
-reg signed [ACC_W-1:0] accumulator;
-reg [3:0] kernel_i, kernel_j;
-reg [4:0] compute_cnt;
+// Motion vectors per output pixel
+reg signed [DATA_W-1:0] offset_x [0:GROUP_ROWS-1][0:GROUP_ROWS-1];
+reg signed [DATA_W-1:0] offset_y [0:GROUP_ROWS-1][0:GROUP_ROWS-1];
 
 // ===== Paper-structured sub-blocks =====
 // RA ping-pong (tile buffer)
@@ -105,11 +100,15 @@ wire signed [DATA_W-1:0] ra_v01 = ra_v01_u;
 wire signed [DATA_W-1:0] ra_v10 = ra_v10_u;
 wire signed [DATA_W-1:0] ra_v11 = ra_v11_u;
 
-// Address conversion and coefficient path for current kernel tap
-wire [3:0] base_x0_w = {2'b00, pixel_cnt[1:0]} + kernel_j[3:0];
-wire [3:0] base_y0_w = {2'b00, pixel_cnt[3:2]} + kernel_i[3:0];
-wire signed [DATA_W-1:0] off_x_cur = offset_x[kernel_i][kernel_j];
-wire signed [DATA_W-1:0] off_y_cur = offset_y[kernel_i][kernel_j];
+// Address conversion and coefficient path for current output pixel
+wire [1:0] pix_x = pixel_cnt[1:0];
+wire [1:0] pix_y = pixel_cnt[3:2];
+
+wire [3:0] base_x0_w = {2'b00, pix_x};
+wire [3:0] base_y0_w = {2'b00, pix_y};
+
+wire signed [DATA_W-1:0] off_x_cur = offset_x[pix_y][pix_x];
+wire signed [DATA_W-1:0] off_y_cur = offset_y[pix_y][pix_x];
 
 wire [3:0] base_x_clipped, base_y_clipped;
 wire [FRAC_BITS-1:0] frac_x, frac_y;
@@ -163,7 +162,6 @@ sbilinear_algo1 #(
 );
 
 reg sb_waiting;
-reg signed [DATA_W-1:0] feature_mul_reg;
 
 // Main FSM
 integer i, j;
@@ -175,10 +173,6 @@ always @(posedge clk or negedge rst_n) begin
         pixel_cnt <= 0;
         dpm_out <= 0;
         dpm_out_valid <= 0;
-        accumulator <= 0;
-        kernel_i <= 0;
-        kernel_j <= 0;
-        compute_cnt <= 0;
 
         ra_start_fill <= 0;
         ra_wr_en <= 0;
@@ -186,15 +180,10 @@ always @(posedge clk or negedge rst_n) begin
         ra_wr_data <= 0;
         sb_valid_in <= 0;
         sb_waiting <= 0;
-        feature_mul_reg <= 0;
-        
-        // Clear buffers
+
+        // Clear motion-vector tiles
         for (i = 0; i < GROUP_ROWS; i = i + 1)
-            for (j = 0; j < GROUP_ROWS; j = j + 1)
-                feature_buffer[i][j] <= 0;
-                
-        for (i = 0; i < KERNEL_SIZE; i = i + 1)
-            for (j = 0; j < KERNEL_SIZE; j = j + 1) begin
+            for (j = 0; j < GROUP_ROWS; j = j + 1) begin
                 offset_x[i][j] <= 0;
                 offset_y[i][j] <= 0;
             end
@@ -210,39 +199,22 @@ always @(posedge clk or negedge rst_n) begin
                 fifo_pop <= 0;
                 cnt <= 0;
                 if (start) begin
-                    state <= READ_FEATURES;
+                    state <= READ_OFFSETS;
                     cnt <= 0;
                 end
             end
             
-            READ_FEATURES: begin
-                // Read transformed features from FIFO
-                if (fifo_data_valid) begin
-                    fifo_pop <= 1'b1;
-                    feature_buffer[cnt[3:2]][cnt[1:0]] <= fifo_data;
-                    cnt <= cnt + 1;
-                    if (cnt == (GROUP_ROWS * GROUP_ROWS - 1)) begin
-                        state <= READ_OFFSETS;
-                        cnt <= 0;
-                        fifo_pop <= 1'b0;
-                    end
-                end else begin
-                    fifo_pop <= 1'b0;
-                end
-            end
-            
             READ_OFFSETS: begin
-                // Read deformable offsets from FIFO
+                // Read motion vectors dx then dy from FIFO
                 if (fifo_data_valid) begin
                     fifo_pop <= 1'b1;
-                    if (cnt < KERNEL_SIZE * KERNEL_SIZE) begin
-                        offset_x[cnt / KERNEL_SIZE][cnt % KERNEL_SIZE] <= fifo_data;
+                    if (cnt < (GROUP_ROWS * GROUP_ROWS)) begin
+                        offset_x[cnt[3:2]][cnt[1:0]] <= fifo_data;
                     end else begin
-                        offset_y[(cnt - KERNEL_SIZE*KERNEL_SIZE) / KERNEL_SIZE]
-                                [(cnt - KERNEL_SIZE*KERNEL_SIZE) % KERNEL_SIZE] <= fifo_data;
+                        offset_y[cnt_dy[3:2]][cnt_dy[1:0]] <= fifo_data;
                     end
                     cnt <= cnt + 1;
-                    if (cnt == (2 * KERNEL_SIZE * KERNEL_SIZE - 1)) begin
+                    if (cnt == (2 * GROUP_ROWS * GROUP_ROWS - 1)) begin
                         state <= READ_REF;
                         cnt <= 0;
                         fifo_pop <= 1'b0;
@@ -267,67 +239,30 @@ always @(posedge clk or negedge rst_n) begin
                     cnt <= cnt + 1;
 
                     if (cnt == (REF_WORDS - 1)) begin
-                        state <= COMPUTE_DEFORM;
+                        state <= SAMPLE;
                         cnt <= 0;
-                        accumulator <= 0;
-                        kernel_i <= 0;
-                        kernel_j <= 0;
-                        compute_cnt <= 0;
                         sb_waiting <= 1'b0;
+                        pixel_cnt <= 0;
                     end
                 end
             end
-            
-            COMPUTE_DEFORM: begin
-                // Sequential kernel-tap scheduling, 1-cycle SBCU latency.
-                if (compute_cnt < (KERNEL_SIZE * KERNEL_SIZE)) begin
-                    if (!sb_waiting) begin
-                        // Launch SBCU for current tap
-                        feature_mul_reg <= feature_buffer[kernel_i][kernel_j];
-                        sb_valid_in <= 1'b1;
-                        sb_waiting <= 1'b1;
-                    end else if (sb_valid_out) begin
-                        // Consume SBCU output and accumulate
-                        accumulator <= accumulator + ($signed(sb_out) * $signed(feature_mul_reg));
 
-                        // Advance kernel tap
-                        if (kernel_j == KERNEL_SIZE-1) begin
-                            kernel_j <= 0;
-                            if (kernel_i == KERNEL_SIZE-1) begin
-                                kernel_i <= 0;
-                            end else begin
-                                kernel_i <= kernel_i + 1;
-                            end
-                        end else begin
-                            kernel_j <= kernel_j + 1;
-                        end
-
-                        compute_cnt <= compute_cnt + 1;
-                        sb_waiting <= 1'b0;
-
-                        if (compute_cnt == (KERNEL_SIZE * KERNEL_SIZE - 1)) begin
-                            state <= OUTPUT;
-                        end
-                    end
-                end
-            end
-            
-            OUTPUT: begin
-                // Output result
-                dpm_out <= accumulator[DATA_W-1:0];
-                dpm_out_valid <= 1'b1;
-                
-                pixel_cnt <= pixel_cnt + 1;
-                if (pixel_cnt == GROUP_ROWS * GROUP_ROWS - 1) begin
-                    state <= IDLE;
-                    pixel_cnt <= 0;
-                end else begin
-                    state <= COMPUTE_DEFORM;
-                    accumulator <= 0;
-                    kernel_i <= 0;
-                    kernel_j <= 0;
-                    compute_cnt <= 0;
+            SAMPLE: begin
+                // One bilinear sample per output pixel using its (dx,dy)
+                if (!sb_waiting) begin
+                    sb_valid_in <= 1'b1;
+                    sb_waiting <= 1'b1;
+                end else if (sb_valid_out) begin
+                    dpm_out <= sb_out;
+                    dpm_out_valid <= 1'b1;
                     sb_waiting <= 1'b0;
+
+                    if (pixel_cnt == (GROUP_ROWS * GROUP_ROWS - 1)) begin
+                        state <= IDLE;
+                        pixel_cnt <= 0;
+                    end else begin
+                        pixel_cnt <= pixel_cnt + 1'b1;
+                    end
                 end
             end
             

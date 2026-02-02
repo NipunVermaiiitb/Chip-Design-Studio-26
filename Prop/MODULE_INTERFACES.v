@@ -151,6 +151,10 @@ module global_controller #(
     input wire credit_available,
     input wire prefetch_busy,
     input wire [3:0] fifo_count,
+
+    // Consumer drain markers (for group-atomic draining)
+    input wire drain_word,
+    input wire drain_last,
     
     // NEW: Control outputs
     output reg sftm_enable,

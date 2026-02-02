@@ -22,6 +22,10 @@ module global_controller #(
     
     // FIFO status
     input wire [3:0] fifo_count,
+
+    // Consumer drain markers (for group-atomic draining)
+    input wire drain_word,
+    input wire drain_last,
     
     // Control outputs
     output reg sftm_enable,
@@ -53,6 +57,23 @@ typedef enum reg [2:0] {
 } ctrl_state_t;
 
 ctrl_state_t ctrl_state;
+
+// Ensure drain/backpressure is group-atomic: once we start draining a group,
+// keep consumer enabled until the end-of-group marker is observed.
+reg draining_group;
+
+always @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+        draining_group <= 1'b0;
+    end else if (ctrl_state == IDLE) begin
+        draining_group <= 1'b0;
+    end else if (drain_word) begin
+        if (drain_last)
+            draining_group <= 1'b0;
+        else
+            draining_group <= 1'b1;
+    end
+end
 
 // Performance monitoring
 reg [15:0] cycle_count;
@@ -131,7 +152,7 @@ always @(posedge clk or negedge rst_n) begin
                 end
                 
                 // DPM control: enable if FIFO has data
-                if (!fifo_empty) begin
+                if (!fifo_empty || draining_group) begin
                     dpm_enable <= 1'b1;
                 end else begin
                     dpm_enable <= 1'b0;
@@ -146,7 +167,7 @@ always @(posedge clk or negedge rst_n) begin
                 end
                 
                 // Check for completion (simplified - could add frame count)
-                if (!start && fifo_empty && !dpm_processing) begin
+                if (!start && fifo_empty && !dpm_processing && !draining_group) begin
                     ctrl_state <= WAIT_DRAIN;
                 end
                 
@@ -184,12 +205,15 @@ always @(posedge clk or negedge rst_n) begin
                 sftm_enable <= 1'b0;
                 prefetch_enable <= 1'b0;
                 system_state <= STATE_RUNNING;
-                
-                if (!dpm_processing) begin
+
+                // Only allow disabling the consumer between groups
+                if (!dpm_processing && !draining_group) begin
                     dpm_enable <= 1'b0;
+                end else begin
+                    dpm_enable <= 1'b1;
                 end
-                
-                if (fifo_empty && !dpm_processing) begin
+
+                if (fifo_empty && !dpm_processing && !draining_group) begin
                     ctrl_state <= DONE;
                 end
             end

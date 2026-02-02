@@ -11,9 +11,17 @@ module tb_vcnpu_integrated;
     parameter N_CH = 36;
     parameter GROUP_ROWS = 4;
     parameter DEPTH_GROUPS = 2;
+    parameter WEIGHT_ADDR_W = 14;
     parameter FRAME_WIDTH = 64;   // Small frame for testing
     parameter FRAME_HEIGHT = 64;
     parameter TILE_SIZE = 16;
+
+    // RepVCN fusion weight-list sizing (used for optional fusion runs)
+    localparam int FUSED_CH = 32;
+    localparam int SCU_OUT_PAR = 3;
+    localparam int CHANNEL_LOOP_COUNT = (FUSED_CH + SCU_OUT_PAR - 1) / SCU_OUT_PAR; // 11
+    localparam int WEIGHTS_PER_PASS = 18;
+    localparam int RF_LIST_WORDS = CHANNEL_LOOP_COUNT * FUSED_CH * WEIGHTS_PER_PASS; // 6336
     
     parameter CLK_PERIOD = 10;  // 100 MHz
 
@@ -27,11 +35,11 @@ module tb_vcnpu_integrated;
     reg [31:0] ref_frame_base_addr;
     reg conv_mode;
     reg [1:0] quality_mode;
-    
+
     // Input stream
     reg [DATA_W-1:0] input_data;
     reg input_valid;
-    
+
     // DRAM interface
     wire dram_req;
     wire [31:0] dram_addr;
@@ -39,11 +47,22 @@ module tb_vcnpu_integrated;
     reg dram_ack;
     reg dram_data_valid;
     reg [DATA_W-1:0] dram_data_in;
-    
+
     // Weight loading
     reg weight_load_en;
-    reg [11:0] weight_load_addr;
+    reg [WEIGHT_ADDR_W-1:0] weight_load_addr;
     reg [DATA_W-1:0] weight_load_data;
+
+    // Index loading
+    reg index_load_en;
+    reg [WEIGHT_ADDR_W-1:0] index_load_addr;
+    reg [9:0] index_load_data;
+
+    // Hybrid fusion controls
+    reg layer_seq_mode;
+    reg [WEIGHT_ADDR_W-1:0] seq_wbase0;
+    reg [WEIGHT_ADDR_W-1:0] seq_wbase1;
+    reg [WEIGHT_ADDR_W-1:0] seq_wbase2;
     
     // Control
     reg start;
@@ -74,6 +93,7 @@ module tb_vcnpu_integrated;
         .N_CH(N_CH),
         .GROUP_ROWS(GROUP_ROWS),
         .DEPTH_GROUPS(DEPTH_GROUPS),
+        .WEIGHT_ADDR_W(WEIGHT_ADDR_W),
         .FRAME_WIDTH(FRAME_WIDTH),
         .FRAME_HEIGHT(FRAME_HEIGHT),
         .TILE_SIZE(TILE_SIZE)
@@ -85,6 +105,10 @@ module tb_vcnpu_integrated;
         .ref_frame_base_addr(ref_frame_base_addr),
         .conv_mode(conv_mode),
         .quality_mode(quality_mode),
+        .layer_seq_mode(layer_seq_mode),
+        .seq_wbase0(seq_wbase0),
+        .seq_wbase1(seq_wbase1),
+        .seq_wbase2(seq_wbase2),
         .input_data(input_data),
         .input_valid(input_valid),
         .dram_req(dram_req),
@@ -96,6 +120,9 @@ module tb_vcnpu_integrated;
         .weight_load_en(weight_load_en),
         .weight_load_addr(weight_load_addr),
         .weight_load_data(weight_load_data),
+        .index_load_en(index_load_en),
+        .index_load_addr(index_load_addr),
+        .index_load_data(index_load_data),
         .start(start),
         .busy(busy),
         .error(error),
@@ -171,9 +198,16 @@ module tb_vcnpu_integrated;
         ref_frame_base_addr = 32'h1000_0000;
         conv_mode = 1;  // Convolution mode
         quality_mode = 0;
+        layer_seq_mode = 0;
+        seq_wbase0 = 0;
+        seq_wbase1 = RF_LIST_WORDS;
+        seq_wbase2 = RF_LIST_WORDS*2;
         weight_load_en = 0;
         weight_load_addr = 0;
         weight_load_data = 0;
+        index_load_en = 0;
+        index_load_addr = 0;
+        index_load_data = 0;
         cycle_count = 0;
         input_count = 0;
         output_count = 0;
@@ -377,19 +411,32 @@ module tb_vcnpu_integrated;
     // Load test weights into weight memory
     task load_weights;
         integer addr;
+        integer max_addr;
     begin
+        // Load enough for: RFConv0 lists + RFConv1 lists + a small deconv region
+        max_addr = (RF_LIST_WORDS * 2) + 128;
+
         weight_load_en = 1'b1;
-        for (addr = 0; addr < 256; addr = addr + 1) begin
+        index_load_en = 1'b1;
+        for (addr = 0; addr < max_addr; addr = addr + 1) begin
             @(posedge clk);
-            weight_load_addr = addr;
-            // Simple pattern: diagonal emphasis
-            if (addr % 17 == 0)  // Diagonal positions
-                weight_load_data = 16'h4000;  // 0.25 in fixed point
+            weight_load_addr = addr[WEIGHT_ADDR_W-1:0];
+            index_load_addr  = addr[WEIGHT_ADDR_W-1:0];
+
+            // Weight pattern: repeatable, non-trivial
+            if ((addr % 19) == 0)
+                weight_load_data = 16'h2000;
+            else if ((addr % 7) == 0)
+                weight_load_data = 16'hF000;
             else
-                weight_load_data = 16'h1000;  // 0.0625 in fixed point
+                weight_load_data = 16'h0100;
+
+            // Index pattern (tile36 positions): 0..35
+            index_load_data = (addr % 36);
         end
         @(posedge clk);
         weight_load_en = 1'b0;
+        index_load_en = 1'b0;
     end
     endtask
 

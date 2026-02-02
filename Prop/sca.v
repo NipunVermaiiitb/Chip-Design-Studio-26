@@ -32,6 +32,139 @@ module sca #(
 );
 
 //==============================================================================
+// Paper-SCU path (incremental migration)
+//
+// The reference paper SCU computes sparse element-wise multiplications in the
+// transform domain using (weights,indexes) lists and gathers activations from a
+// 36-entry tile. It outputs 3 banks of 16 outputs.
+//
+// This repository's SFTM currently expects a single transform tile output
+// u_out[N_ROWS][N_COLS]. To move toward the paper architecture without breaking
+// the rest of the pipeline, we use the paper SCU for the 4x4 conv case
+// (IN_SIZE==16) and map OC0[0..15] back into u_out[4][4].
+//
+// For other sizes (e.g., 6x6 deconv), we fall back to the existing sparse list
+// scheduler below.
+//==============================================================================
+
+localparam integer IN_SIZE  = N_ROWS * N_COLS;
+localparam integer IDX_BITS = (IN_SIZE <= 1) ? 1 : $clog2(IN_SIZE);
+
+generate
+if (IN_SIZE == 16) begin : GEN_PAPER_SCU
+
+    // Flattened 36-entry activation tile expected by the paper SCU
+    wire signed [DATA_W-1:0] input_tile36 [0:35];
+    genvar fa;
+    for (fa = 0; fa < 36; fa = fa + 1) begin : FLAT_ACT
+        if (fa < 16) begin
+            assign input_tile36[fa] = y_in[fa[3:2]][fa[1:0]];
+        end else begin
+            assign input_tile36[fa] = '0;
+        end
+    end
+
+    // Weights/indices lists for SCU
+    // Migration choice: represent dense 4x4 element-wise multiply by phasing
+    // 6 coefficients per cycle (k=0..5), over 3 cycles (ceil(16/6)=3).
+    // This preserves correctness for the current dense weight_data interface.
+    localparam int PHASES = 3;
+    reg [1:0] phase;
+    reg running;
+
+    // SCU inputs
+    reg signed [DATA_W-1:0] weights18 [0:17];
+    reg [5:0] indexes18 [0:17];
+    reg scu_en, scu_clear;
+
+    wire signed [DATA_W-1:0] OC0 [0:15];
+    wire signed [DATA_W-1:0] OC1 [0:15];
+    wire signed [DATA_W-1:0] OC2 [0:15];
+
+    integer wi;
+    always @(*) begin
+        // default all zeros
+        for (wi = 0; wi < 18; wi = wi + 1) begin
+            weights18[wi] = '0;
+            indexes18[wi] = '0;
+        end
+
+        // Fill only first 6 entries for OC0 bank this cycle.
+        // Map phase to coefficient indices:
+        // phase 0: idx 0..5, phase 1: 6..11, phase 2: 12..15 (and 16/17 unused)
+        for (wi = 0; wi < 6; wi = wi + 1) begin
+            int coeff_idx;
+            coeff_idx = (phase * 6) + wi;
+            if (coeff_idx < 16) begin
+                indexes18[wi] = coeff_idx[5:0];
+                // Flatten weight_data row-major
+                weights18[wi] = weight_data[coeff_idx[3:2]][coeff_idx[1:0]];
+            end
+        end
+    end
+
+    scu_paper #(
+        .A_bits(DATA_W),
+        .W_bits(DATA_W),
+        .I_bits(6),
+        .ACC_bits(ACC_W)
+    ) u_scu_paper (
+        .clk(clk),
+        .rst_n(rst_n),
+        .mode(1'b1),
+        .en(scu_en),
+        .clear(scu_clear),
+        .weights(weights18),
+        .input_tile(input_tile36),
+        .indexes(indexes18),
+        .OC0(OC0),
+        .OC1(OC1),
+        .OC2(OC2)
+    );
+
+    integer orow, ocol;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            valid_out <= 1'b0;
+            running <= 1'b0;
+            phase <= 0;
+            scu_en <= 1'b0;
+            scu_clear <= 1'b0;
+            for (orow = 0; orow < N_ROWS; orow = orow + 1)
+                for (ocol = 0; ocol < N_COLS; ocol = ocol + 1)
+                    u_out[orow][ocol] <= '0;
+        end else begin
+            valid_out <= 1'b0;
+            scu_en <= 1'b0;
+            scu_clear <= 1'b0;
+
+            if (valid_in && !running) begin
+                // start new tile
+                running <= 1'b1;
+                phase <= 0;
+                scu_clear <= 1'b1;
+            end else if (running) begin
+                // run one SCU update per phase
+                scu_en <= 1'b1;
+
+                if (phase == (PHASES-1)) begin
+                    // done this tile: capture OC0 into u_out
+                    for (orow = 0; orow < 4; orow = orow + 1)
+                        for (ocol = 0; ocol < 4; ocol = ocol + 1)
+                            u_out[orow][ocol] <= {{(ACC_W-DATA_W){OC0[{orow[1:0], ocol[1:0]}][DATA_W-1]}}, OC0[{orow[1:0], ocol[1:0]}]};
+
+                    valid_out <= 1'b1;
+                    running <= 1'b0;
+                end else begin
+                    phase <= phase + 1'b1;
+                end
+            end
+        end
+    end
+
+end else begin : GEN_FALLBACK_SCHED
+
+//==============================================================================
 // Sparse compute core (paper-style): Nonzero list + index-driven selection +
 // psum scatter/accumulation scheduling.
 //
@@ -47,9 +180,6 @@ module sca #(
 // This matches Fig. 6's concept: select Yd[src] with S, multiply by H,
 // then scatter into accumulator for U[dest].
 //==============================================================================
-
-localparam integer IN_SIZE  = N_ROWS * N_COLS;
-localparam integer IDX_BITS = (IN_SIZE <= 1) ? 1 : $clog2(IN_SIZE);
 
 // Internal regfiles
 reg signed [DATA_W-1:0] y_reg_flat [0:IN_SIZE-1];
@@ -137,6 +267,9 @@ always @(posedge clk or negedge rst_n) begin
         end
     end
 end
+
+end
+endgenerate
 
 // Weight/Index address generation (simplified - could be more sophisticated)
 reg [WEIGHT_ADDR_W-1:0] addr_cnt;
