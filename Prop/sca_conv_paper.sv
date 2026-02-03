@@ -101,12 +101,26 @@ module sca_conv_paper #(
     reg fallback_busy;
     reg [$clog2(IN_SIZE+1)-1:0] k;
 
+    // Index entry packing: historically this repo uses a fixed-width packed format
+    // inside INDEX_ADDR_W bits (default 10):
+    //   [INDEX_ADDR_W-1]         : enable
+    //   [2*PACK_BITS-1:PACK_BITS]: dst
+    //   [PACK_BITS-1:0]          : src
+    // When N_ROWS*N_COLS grows (e.g. 6x6 => IDX_BITS=6), INDEX_ADDR_W may be
+    // smaller than (1 + 2*IDX_BITS). To keep synthesis legal, derive PACK_BITS
+    // from INDEX_ADDR_W and zero-extend into IDX_BITS.
+    localparam int PACK_BITS = ((INDEX_ADDR_W-1)/2 < 1) ? 1 : ((INDEX_ADDR_W-1)/2);
+
     wire entry_en;
     wire [IDX_BITS-1:0] entry_src;
     wire [IDX_BITS-1:0] entry_dst;
+
+    wire [PACK_BITS-1:0] entry_src_p = s_reg_flat[k][PACK_BITS-1:0];
+    wire [PACK_BITS-1:0] entry_dst_p = s_reg_flat[k][(2*PACK_BITS)-1:PACK_BITS];
+
     assign entry_en  = s_reg_flat[k][INDEX_ADDR_W-1];
-    assign entry_src = s_reg_flat[k][IDX_BITS-1:0];
-    assign entry_dst = s_reg_flat[k][(2*IDX_BITS)-1:IDX_BITS];
+    assign entry_src = {{(IDX_BITS-PACK_BITS){1'b0}}, entry_src_p};
+    assign entry_dst = {{(IDX_BITS-PACK_BITS){1'b0}}, entry_dst_p};
 
     wire signed [DATA_W-1:0] h_cur = h_reg_flat[k];
     wire signed [DATA_W-1:0] y_cur = y_reg_flat[entry_src];

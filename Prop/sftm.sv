@@ -1,4 +1,4 @@
-﻿// sftm.v
+// sftm.v
 // Top-level SFTM: Full pipeline PreTA -> SCA -> PosTA -> QMU
 // Produces group_data per GROUP_ROWS rows and asserts group_done.
 // Supports both convolution (4x4->2x2) and deconvolution (4x4->4x4) modes
@@ -242,6 +242,7 @@ assign buf_input_data  = iqmu_enable ? iqmu_out  : input_data;
 assign buf_input_valid = iqmu_enable ? iqmu_valid : input_valid;
 
 // ====== Input Buffer: Collect 4x4 patches ======
+logic signed [DATA_W-1:0] input_buffer [0:3][0:3];
 reg [4:0] buf_cnt;
 reg buf_ready;
 reg buf_ready_force;

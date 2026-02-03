@@ -1,4 +1,4 @@
-﻿// reshuffle_network.sv
+// reshuffle_network.sv
 // Lightweight reshuffle network between PosT array and output buffer.
 //
 // In the VCNPU paper (Fig. 3(b)), a reshuffle network helps align / reorder

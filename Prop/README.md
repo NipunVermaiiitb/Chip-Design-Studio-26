@@ -62,7 +62,7 @@ VCNPU is a hardware accelerator for neural video compression implementing **Wino
 │ scu.v                │    ✅    │    ✅    │  (unchanged)   │
 │ credit_fsm.v         │    ✅    │    ✅    │  (unchanged)   │
 │ group_sync_fifo.v    │    ✅    │    ✅    │  (unchanged)   │
-│ vcnpu_top.v          │    🟡    │    ✅    │  INTEGRATED    │
+│ vcnpu_top.sv         │    🟡    │    ✅    │  INTEGRATED    │
 └──────────────────────┴──────────┴──────────┴────────────────┘
 
 Legend: ❌ Missing  🟡 Mock/Stub  ✅ Complete
@@ -358,7 +358,7 @@ output reg error
 
 ## Integration Details
 
-### vcnpu_top.v Updates
+### vcnpu_top.sv Updates
 
 #### New Top-Level Ports
 ```verilog
@@ -531,7 +531,7 @@ if (error) $error("System fault detected");
 ```bash
 # Compile all modules
 iverilog -g2012 -o vcnpu_sim \
-    vcnpu_top.v \
+    vcnpu_top.sv \
     sftm.v sca.v dpm.v \
     split_prefetcher.v global_controller.v \
     group_sync_fifo.v credit_fsm.v \
@@ -754,7 +754,7 @@ vcnpu_top #(
 ```
 Prop/
 ├── README.md                       ← You are here
-├── vcnpu_top.v                    # Top-level integration
+├── vcnpu_top.sv                   # Top-level integration
 ├── sftm.v                         # SFTM pipeline
 ├── sca.v                          # Sparse computing array
 ├── dpm.v                          # Deformable processing

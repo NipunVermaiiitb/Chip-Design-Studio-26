@@ -1,4 +1,4 @@
-// vcnpu_top.v
+// vcnpu_top.sv
 // Top-level for VCNPU + Group-Synchronized Forwarding integration
 // Complete integration with SFTM pipeline, DPM deformable conv, smart prefetcher, and advanced controller
 
