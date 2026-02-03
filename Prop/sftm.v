@@ -10,7 +10,7 @@ module sftm #(
     parameter N_CH = 36,
     parameter GROUP_ROWS = 4,
     parameter WEIGHT_ADDR_W = 12,
-	 parameter INDEX_ADDR_W = 10
+	parameter INDEX_ADDR_W = 10
 )(
     input wire clk,
     input wire rst_n,
@@ -31,20 +31,20 @@ module sftm #(
     // Deconv motion-vector second channel weights (dy)
     input wire signed [DATA_W-1:0] weight_data_dy [0:3][0:3],
 
-	 // Paper-SCU sparse lists for RFConv (3 filters × ~6 nonzeros each)
-	 input wire signed [DATA_W-1:0] scu_weights [0:17],
-	 input wire [5:0]               scu_indexes [0:17],
+	// Paper-SCU sparse lists for RFConv (3 filters × ~6 nonzeros each)
+	input wire signed [DATA_W-1:0] scu_weights [0:17],
+	input wire [5:0]               scu_indexes [0:17],
 
-	 // Index memory interface (legacy/fallback sparse computing)
-	 output wire [INDEX_ADDR_W-1:0] index_addr,
-	 input wire [INDEX_ADDR_W-1:0] index_data [0:3][0:3],
-	    input wire [INDEX_ADDR_W-1:0] index_data_dy [0:3][0:3],
+	// Index memory interface (legacy/fallback sparse computing)
+	output wire [INDEX_ADDR_W-1:0] index_addr,
+	input wire [INDEX_ADDR_W-1:0] index_data [0:3][0:3],
+	input wire [INDEX_ADDR_W-1:0] index_data_dy [0:3][0:3],
 
-	 // Hybrid Layer Fusion control
-	 input wire layer_seq_mode,
-	 input wire [WEIGHT_ADDR_W-1:0] seq_wbase0,
-	 input wire [WEIGHT_ADDR_W-1:0] seq_wbase1,
-	 input wire [WEIGHT_ADDR_W-1:0] seq_wbase2,
+	// Hybrid Layer Fusion control
+	input wire layer_seq_mode,
+	input wire [WEIGHT_ADDR_W-1:0] seq_wbase0,
+	input wire [WEIGHT_ADDR_W-1:0] seq_wbase1,
+	input wire [WEIGHT_ADDR_W-1:0] seq_wbase2,
     
     // Outputs
     output reg group_valid,
@@ -79,13 +79,24 @@ reg seq_enter_deconv;
 
 // Intermediate banks: planar (channel-major), each channel stores the 36-entry SCU tile.
 // Entries 0..15 carry the 4x4 transform coefficients; 16..35 are zero (padding).
-reg signed [DATA_W-1:0] bank_in_tile36 [0:FUSED_CH-1][0:35];
+// 4-bank upgrade: split input bank into ping/pong so RFConv0 can compute from one
+// while the loader fills the other.
+reg signed [DATA_W-1:0] bank_in_ping_tile36 [0:FUSED_CH-1][0:35];
+reg signed [DATA_W-1:0] bank_in_pong_tile36 [0:FUSED_CH-1][0:35];
 reg signed [DATA_W-1:0] bank0_tile36 [0:FUSED_CH-1][0:35];
 reg signed [DATA_W-1:0] bank1_tile36 [0:FUSED_CH-1][0:35];
 
 // RFConv0 input loader (builds planar BankIn from the external stream via PreTA)
 reg [4:0] rf0_load_ch;
-reg rf0_inputs_ready;
+reg input_bank_sel;   // 0=ping is fill bank, 1=pong is fill bank
+reg in_ping_full;
+reg in_pong_full;
+wire rf0_inputs_ready;
+wire compute_bank_sel = ~input_bank_sel;
+wire fill_bank_full   = input_bank_sel ? in_pong_full : in_ping_full;
+wire compute_bank_full = compute_bank_sel ? in_pong_full : in_ping_full;
+assign rf0_inputs_ready = compute_bank_full;
+reg rf0_compute_busy;
 
 // RFConv0 (standard conv): outer loop over output batches (ob0_idx), inner loop over input channels (ic0_idx)
 reg [3:0] ob0_idx;
@@ -131,37 +142,68 @@ function automatic signed [DATA_W-1:0] sat_acc_to_data(input signed [ACC_W-1:0] 
 	end
 endfunction
 
-integer li;
+integer li, lj, rr, cc, kk;
 always @(posedge clk or negedge rst_n) begin
 	if (!rst_n) begin
 		rf0_load_ch <= 0;
-		rf0_inputs_ready <= 1'b0;
+		input_bank_sel <= 1'b0;
+		in_ping_full <= 1'b0;
+		in_pong_full <= 1'b0;
 		for (li = 0; li < FUSED_CH; li = li + 1) begin
-			integer lj;
 			for (lj = 0; lj < 36; lj = lj + 1) begin
-				bank_in_tile36[li][lj] <= '0;
+				bank_in_ping_tile36[li][lj] <= '0;
+				bank_in_pong_tile36[li][lj] <= '0;
 			end
 		end
 	end else begin
-		// Default: keep until next fusion start
-		if (!layer_seq_mode || !seq_active || (seq_stage != SEQ_STAGE_CONV0)) begin
+		// Cross-tile pipelining: do NOT clear ping/pong state just because we're
+		// temporarily not in CONV0; only clear when fusion mode is off or when a
+		// new fused tile begins.
+		if (!layer_seq_mode) begin
 			rf0_load_ch <= 0;
-			rf0_inputs_ready <= 1'b0;
-		end else begin
-			// Capture each channel's PreTA output into BankIn
-			if (preta_valid_conv && !rf0_inputs_ready) begin
-				integer rr, cc;
+			input_bank_sel <= 1'b0;
+			in_ping_full <= 1'b0;
+			in_pong_full <= 1'b0;
+		end else if (start && !seq_active) begin
+			rf0_load_ch <= 0;
+			input_bank_sel <= 1'b0;
+			in_ping_full <= 1'b0;
+			in_pong_full <= 1'b0;
+		end else if (seq_active && (seq_stage == SEQ_STAGE_CONV0)) begin
+			// When RFConv0 starts consuming the compute bank, clear its full flag.
+			if (rf0_inputs_ready && !rf0_compute_busy) begin
+				if (!compute_bank_sel) in_ping_full <= 1'b0;
+				else                  in_pong_full <= 1'b0;
+			end
+
+			// If compute is idle and the fill bank is full (but compute bank is empty),
+			// swap roles so compute sees the full bank.
+			if (!rf0_compute_busy && fill_bank_full && !compute_bank_full) begin
+				input_bank_sel <= ~input_bank_sel;
+			end
+
+			// Capture each channel's PreTA output into the current fill bank.
+			if (preta_valid_conv && !fill_bank_full) begin
 				for (rr = 0; rr < 4; rr = rr + 1) begin
 					for (cc = 0; cc < 4; cc = cc + 1) begin
-						bank_in_tile36[rf0_load_ch][{rr[1:0], cc[1:0]}] <= sat_acc_to_data(preta_out_conv[rr][cc]);
+						if (!input_bank_sel)
+							bank_in_ping_tile36[rf0_load_ch][{rr[1:0], cc[1:0]}] <= sat_acc_to_data(preta_out_conv[rr][cc]);
+						else
+							bank_in_pong_tile36[rf0_load_ch][{rr[1:0], cc[1:0]}] <= sat_acc_to_data(preta_out_conv[rr][cc]);
 					end
 				end
-				for (li = 16; li < 36; li = li + 1) begin
-					bank_in_tile36[rf0_load_ch][li] <= '0;
+				for (kk = 16; kk < 36; kk = kk + 1) begin
+					if (!input_bank_sel)
+						bank_in_ping_tile36[rf0_load_ch][kk] <= '0;
+					else
+						bank_in_pong_tile36[rf0_load_ch][kk] <= '0;
 				end
 
 				if (rf0_load_ch == (FUSED_CH-1)) begin
-					rf0_inputs_ready <= 1'b1;
+					// Mark fill bank full.
+					if (!input_bank_sel) in_ping_full <= 1'b1;
+					else                in_pong_full <= 1'b1;
+					rf0_load_ch <= 0;
 				end else begin
 					rf0_load_ch <= rf0_load_ch + 1'b1;
 				end
@@ -176,33 +218,30 @@ wire iqmu_valid;
 wire [DATA_W-1:0] iqmu_out;
 reg iqmu_enable;
 
-// Determine if we're in synthesis (decoding) mode
-// In synthesis mode, apply IQMU first; in analysis mode, apply QMU last
+// In synthesis mode, apply IQMU first; in analysis mode, apply QMU last.
 always @(*) begin
-    // Simple heuristic: if we're doing deconv, assume synthesis mode
-	 iqmu_enable = !op_conv_mode; 	// Deconv typically used in synthesis
+	// Heuristic: deconv implies synthesis path.
+	iqmu_enable = !op_conv_mode;
 end
 
 iqmu #(
-    .DATA_W(DATA_W)
+	.DATA_W(DATA_W)
 ) u_iqmu (
-    .clk(clk),
-    .rst_n(rst_n),
-    .valid_in(input_valid && iqmu_enable),
-    .data_in(input_data),
-    .quality_mode(quality_mode),
-    .valid_out(iqmu_valid),
-    .data_out(iqmu_out)
+	.clk(clk),
+	.rst_n(rst_n),
+	.valid_in(input_valid && iqmu_enable),
+	.data_in(input_data),
+	.valid_out(iqmu_valid),
+	.data_out(iqmu_out)
 );
 
 // Select between IQMU output (synthesis) or direct input (analysis)
 wire [DATA_W-1:0] buf_input_data;
 wire buf_input_valid;
-assign buf_input_data = iqmu_enable ? iqmu_out : input_data;
+assign buf_input_data  = iqmu_enable ? iqmu_out  : input_data;
 assign buf_input_valid = iqmu_enable ? iqmu_valid : input_valid;
 
 // ====== Input Buffer: Collect 4x4 patches ======
-reg signed [DATA_W-1:0] input_buffer [0:3][0:3];
 reg [4:0] buf_cnt;
 reg buf_ready;
 reg buf_ready_force;
@@ -483,19 +522,24 @@ end
 
 //==============================================================================
 // RFConv0 standard convolution engine
-// - Loads 32 input-channel tiles via PreTA into bank_in_tile36.
+// - Loads 32 input-channel tiles via PreTA into ping/pong input banks.
 // - Output-stationary: for each output-batch (k,k+1,k+2), accumulate over ic=0..31.
 // - Write-back: store 3 output tiles to bank0_tile36.
 //==============================================================================
 
 wire rf0_active;
-assign rf0_active = layer_seq_mode && seq_active && (seq_stage == SEQ_STAGE_CONV0) && rf0_inputs_ready;
+assign rf0_active = layer_seq_mode && seq_active && (seq_stage == SEQ_STAGE_CONV0) && (rf0_inputs_ready || rf0_compute_busy);
+
+// Latch which input bank RFConv0 reads from for the duration of a compute.
+reg rf0_compute_bank_sel;
 
 wire signed [DATA_W-1:0] rf0_input_tile [0:35];
 genvar rf0i;
 generate
 	for (rf0i = 0; rf0i < 36; rf0i = rf0i + 1) begin : RF0_TILE
-		assign rf0_input_tile[rf0i] = bank_in_tile36[ic0_idx][rf0i];
+		assign rf0_input_tile[rf0i] = rf0_compute_bank_sel ?
+			bank_in_pong_tile36[ic0_idx][rf0i] :
+			bank_in_ping_tile36[ic0_idx][rf0i];
 	end
 endgenerate
 
@@ -540,6 +584,8 @@ always @(posedge clk or negedge rst_n) begin
 		ob0_idx <= 0;
 		ic0_idx <= 0;
 		conv0_done_pulse <= 1'b0;
+		rf0_compute_bank_sel <= 1'b0;
+		rf0_compute_busy <= 1'b0;
 	end else begin
 		conv0_done_pulse <= 1'b0;
 		rf0_clear <= 1'b0;
@@ -549,9 +595,14 @@ always @(posedge clk or negedge rst_n) begin
 			rf0_state <= RF0_IDLE;
 			ob0_idx <= 0;
 			ic0_idx <= 0;
+			rf0_compute_busy <= 1'b0;
 		end else begin
 			case (rf0_state)
 				RF0_IDLE: begin
+					// Capture which bank we will read for this compute (the current compute bank).
+					rf0_compute_bank_sel <= compute_bank_sel;
+					rf0_compute_busy <= 1'b1;
+
 					rf0_state <= RF0_CLEAR;
 					ic0_idx <= 0;
 				end
@@ -588,6 +639,7 @@ always @(posedge clk or negedge rst_n) begin
 						conv0_done_pulse <= 1'b1;
 						ob0_idx <= 0;
 						rf0_state <= RF0_IDLE;
+						rf0_compute_busy <= 1'b0;
 					end else begin
 						ob0_idx <= ob0_idx + 1'b1;
 						rf0_state <= RF0_CLEAR;
