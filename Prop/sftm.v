@@ -335,15 +335,25 @@ assign sca_valid_in_conv = (!layer_seq_mode) ? preta_valid_conv : 1'b0;
 
 sca_conv_paper #(
 	 .DATA_W(DATA_W),
-	 .ACC_W(ACC_W)
+	 .ACC_W(ACC_W),
+	 .N_ROWS(4),
+	 .N_COLS(4),
+	 .WEIGHT_ADDR_W(WEIGHT_ADDR_W),
+	 .INDEX_ADDR_W(INDEX_ADDR_W)
 ) u_sca_conv (
 	 .clk(clk),
 	 .rst_n(rst_n),
 	 .valid_in(sca_valid_in_conv),
+	 .use_list_mode(1'b1),
 	 .y_in(sca_y_in_conv),
+	 .weight_data(weight_data),
+	 .index_data(index_data_4x4),
 	 .weights18(scu_weights),
 	 .indexes18(scu_indexes),
+	 .weight_addr(),
+	 .index_addr(),
 	 .valid_out(sca_valid_conv),
+	 .u_out(),
 	 .u0_out(sca_out_conv0),
 	 .u1_out(sca_out_conv1),
 	 .u2_out(sca_out_conv2)
@@ -668,44 +678,57 @@ always @(*) begin
     end
 end
 
-sca #(
-    .DATA_W(DATA_W),
-    .ACC_W(ACC_W),
-    .N_ROWS(6),
-    .N_COLS(6),
-    .WEIGHT_ADDR_W(WEIGHT_ADDR_W),
-    .INDEX_ADDR_W(INDEX_ADDR_W)
+// Deconv uses the same generalized SCA module but in fallback (dense/index) mode.
+sca_conv_paper #(
+	 .DATA_W(DATA_W),
+	 .ACC_W(ACC_W),
+	 .N_ROWS(6),
+	 .N_COLS(6),
+	 .WEIGHT_ADDR_W(WEIGHT_ADDR_W),
+	 .INDEX_ADDR_W(INDEX_ADDR_W)
 ) u_sca_deconv (
-    .clk(clk),
-    .rst_n(rst_n),
-    .valid_in(preta_valid_deconv),
-    .y_in(sca_in_deconv),
-    .weight_data(weight_data_6x6),
-    .index_data(index_data_6x6),
-    .weight_addr(sca_weight_addr_deconv),
-    .index_addr(sca_index_addr_deconv),
-    .valid_out(sca_valid_deconv),
-    .u_out(sca_out_deconv)
+	 .clk(clk),
+	 .rst_n(rst_n),
+	 .valid_in(preta_valid_deconv),
+	 .use_list_mode(1'b0),
+	 .y_in(sca_in_deconv),
+	 .weight_data(weight_data_6x6),
+	 .index_data(index_data_6x6),
+	 .weights18(scu_weights),
+	 .indexes18(scu_indexes),
+	 .weight_addr(sca_weight_addr_deconv),
+	 .index_addr(sca_index_addr_deconv),
+	 .valid_out(sca_valid_deconv),
+	 .u_out(sca_out_deconv),
+	 .u0_out(),
+	 .u1_out(),
+	 .u2_out()
 );
 
-sca #(
-    .DATA_W(DATA_W),
-    .ACC_W(ACC_W),
-    .N_ROWS(6),
-    .N_COLS(6),
-    .WEIGHT_ADDR_W(WEIGHT_ADDR_W),
-    .INDEX_ADDR_W(INDEX_ADDR_W)
+sca_conv_paper #(
+	 .DATA_W(DATA_W),
+	 .ACC_W(ACC_W),
+	 .N_ROWS(6),
+	 .N_COLS(6),
+	 .WEIGHT_ADDR_W(WEIGHT_ADDR_W),
+	 .INDEX_ADDR_W(INDEX_ADDR_W)
 ) u_sca_deconv_dy (
-    .clk(clk),
-    .rst_n(rst_n),
-    .valid_in(preta_valid_deconv),
-    .y_in(sca_in_deconv),
-    .weight_data(weight_data_6x6_dy),
-    .index_data(index_data_6x6_dy),
-    .weight_addr(sca_weight_addr_deconv_dy),
-    .index_addr(sca_index_addr_deconv_dy),
-    .valid_out(sca_valid_deconv_dy),
-    .u_out(sca_out_deconv_dy)
+	 .clk(clk),
+	 .rst_n(rst_n),
+	 .valid_in(preta_valid_deconv),
+	 .use_list_mode(1'b0),
+	 .y_in(sca_in_deconv),
+	 .weight_data(weight_data_6x6_dy),
+	 .index_data(index_data_6x6_dy),
+	 .weights18(scu_weights),
+	 .indexes18(scu_indexes),
+	 .weight_addr(sca_weight_addr_deconv_dy),
+	 .index_addr(sca_index_addr_deconv_dy),
+	 .valid_out(sca_valid_deconv_dy),
+	 .u_out(sca_out_deconv_dy),
+	 .u0_out(),
+	 .u1_out(),
+	 .u2_out()
 );
 
 // Mux weight and index addresses based on mode
