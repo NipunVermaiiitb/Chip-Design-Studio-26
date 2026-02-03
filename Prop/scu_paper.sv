@@ -3,8 +3,7 @@
 // - 36 activation tile entries
 // - 18 sparse weights + 18 indexes
 // - Accumulates into 3 output-channel banks of 16 outputs (OC0/OC1/OC2)
-//
-// NOTE: This is the architecture you pasted, with one critical fix:
+// - mode=1: Rfconv (3 output channels); mode=0: Rfdeconv (1 output channel)
 // multi-updates to the same destination address in one cycle are accumulated
 // correctly using a temporary "next" accumulator image.
 
