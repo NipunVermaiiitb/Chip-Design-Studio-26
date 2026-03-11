@@ -29,6 +29,7 @@ module split_prefetcher #(
     output reg  [ADDR_WIDTH-1:0] addr,
     output reg  [15:0] len,         // Length in words
     input  wire dram_ack,
+    input  wire dram_data_valid,
     
     // Status
     output wire busy
@@ -39,7 +40,8 @@ typedef enum reg [2:0] {
     IDLE = 0,
     CALC_ADDR = 1,
     ISSUE_REQ = 2,
-    WAIT_ACK = 3
+    WAIT_ACK = 3,
+    WAIT_STREAM = 4
 } state_t;
 
 state_t state;
@@ -52,6 +54,13 @@ reg [15:0] fetch_width;
 reg [15:0] fetch_height;
 reg [ADDR_WIDTH-1:0] calculated_addr;
 reg [15:0] calculated_len;
+reg [15:0] active_len;
+reg [15:0] beat_cnt;
+
+// One-entry queue so we don't drop group_done while a stream is in flight.
+reg next_valid;
+reg [15:0] next_group_x_reg;
+reg [15:0] next_group_y_reg;
 
 assign busy = (state != IDLE);
 
@@ -101,11 +110,30 @@ always @(posedge clk or negedge rst_n) begin
         fetch_height <= TILE_SIZE;
         calculated_addr <= 0;
         calculated_len <= 0;
+        active_len <= 0;
+        beat_cnt <= 0;
+        next_valid <= 1'b0;
+        next_group_x_reg <= 0;
+        next_group_y_reg <= 0;
     end else begin
+        // Queue the next group trigger if we're busy and none is queued yet.
+        if ((state != IDLE) && group_done && !next_valid) begin
+            next_group_x_reg <= group_x;
+            next_group_y_reg <= group_y;
+            next_valid <= 1'b1;
+        end
+
         case (state)
             IDLE: begin
                 issue_req <= 0;
-                if (group_done && !pending) begin
+                beat_cnt <= 0;
+                if (next_valid) begin
+                    // Drain queued trigger first.
+                    current_group_x <= next_group_x_reg;
+                    current_group_y <= next_group_y_reg;
+                    next_valid <= 1'b0;
+                    state <= CALC_ADDR;
+                end else if (group_done && !pending) begin
                     // Capture group position
                     current_group_x <= group_x;
                     current_group_y <= group_y;
@@ -153,52 +181,34 @@ always @(posedge clk or negedge rst_n) begin
                 len <= calculated_len;
                 issue_req <= 1'b1;
                 pending <= 1'b1;
+                active_len <= calculated_len;
+                beat_cnt <= 0;
                 state <= WAIT_ACK;
             end
             
             WAIT_ACK: begin
                 if (dram_ack) begin
-                    // Request acknowledged
+                    // Request acknowledged; now wait for the full stream (active_len beats)
                     issue_req <= 1'b0;
-                    pending <= 1'b0;
-                    state <= IDLE;
+                    state <= WAIT_STREAM;
+                end
+            end
+
+            WAIT_STREAM: begin
+                // Count beats to ensure no overlapping bursts.
+                if (dram_data_valid) begin
+                    if (beat_cnt == (active_len - 1)) begin
+                        pending <= 1'b0;
+                        beat_cnt <= 0;
+                        state <= IDLE;
+                    end else begin
+                        beat_cnt <= beat_cnt + 1'b1;
+                    end
                 end
             end
             
             default: state <= IDLE;
         endcase
-    end
-end
-
-// Pipeline optimization: Pre-calculate next address while waiting for ack
-reg [ADDR_WIDTH-1:0] next_addr;
-reg [15:0] next_group_x_reg;
-reg [15:0] next_group_y_reg;
-reg next_valid;
-
-always @(posedge clk or negedge rst_n) begin
-    if (!rst_n) begin
-        next_addr <= 0;
-        next_group_x_reg <= 0;
-        next_group_y_reg <= 0;
-        next_valid <= 0;
-    end else begin
-        if (state == WAIT_ACK && group_done) begin
-            // Pre-calculate for next group while waiting
-            next_group_x_reg <= group_x;
-            next_group_y_reg <= group_y;
-            next_addr <= calc_ref_addr(
-                ref_frame_base_addr,
-                group_x,
-                group_y,
-                frame_width,
-                TILE_SIZE
-            );
-            next_valid <= 1'b1;
-        end else if (state == IDLE && next_valid) begin
-            // Use pre-calculated address
-            next_valid <= 1'b0;
-        end
     end
 end
 

@@ -1,5 +1,7 @@
 // credit_fsm.v
-// Track number of valid groups in FIFO; indicates when DPM may consume.
+// Track number of complete groups available in the FIFO.
+// Increment when a group is produced (group_done), decrement when the consumer
+// finishes draining a group (last-word marker observed).
 
 `timescale 1ns/1ps
 module credit_fsm #(
@@ -7,8 +9,8 @@ module credit_fsm #(
 )(
     input  wire clk,
     input  wire rst_n,
-    input  wire group_produced,    // increment credit
-    input  wire group_consumed,    // decrement credit
+    input  wire group_produced,    // increment credit (group complete)
+    input  wire group_consumed,    // decrement credit (group drained)
     output wire credit_available
 );
 
@@ -20,13 +22,12 @@ always @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
         credits <= 0;
     end else begin
-        // simple non-overlapping update
+        // Simple non-overlapping update.
         if (group_produced && !group_consumed) begin
-            if (credits < MAX_CREDITS) credits <= credits + 1;
+            if (credits < MAX_CREDITS) credits <= credits + 1'b1;
         end else if (!group_produced && group_consumed) begin
-            if (credits > 0) credits <= credits - 1;
+            if (credits > 0) credits <= credits - 1'b1;
         end
-        // if both asserted, net zero
     end
 end
 

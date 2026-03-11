@@ -1,7 +1,7 @@
 # VCNPU (Video Codec Neural Processing Unit)
 
 **Status**: ✅ Implementation Complete | Ready for Simulation  
-**Last Updated**: January 28, 2026
+**Last Updated**: February 5, 2026
 
 ---
 
@@ -79,20 +79,11 @@ Legend: ❌ Missing  🟡 Mock/Stub  ✅ Complete
 ├─────────────────────────────────────────────────────────────┤
 │                                                              │
 │  Weight Memory (4KB)                                         │
-│    ↓ weight_data[4][4]                                      │
-│  ┌──────────────────────────────────────────────────────┐  │
-│  │ SFTM Pipeline (input_data → ... → group_data)       │  │
-│  │  • Input Buffer (4×4 patch collector)                │  │
 │  │  • PreTA (Winograd pre-transform)                    │  │
-│  │  • SCA (Sparse computing with weights)               │  │
 │  │  • PosTA (Winograd post-transform)                   │  │
 │  │  • QMU (Quality modulation)                          │  │
 │  └────────┬─────────────────────────────────────────────┘  │
 │           │ sftm_data                                       │
-│  ┌────────▼─────────────────────────────────────────────┐  │
-│  │ Group FIFO (credit-based buffering)                  │  │
-│  └────────┬─────────────────────────────────────────────┘  │
-│           │ fifo_dout          ┌──────────────────────┐    │
 │           │                    │  Split Prefetcher    │    │
 │  ┌────────▼─────────────┐      │  • Address calc      │    │
 │  │ DPM (Deformable Conv)│◄─────┤  • Bounds check      │    │
@@ -103,65 +94,31 @@ Legend: ❌ Missing  🟡 Mock/Stub  ✅ Complete
 │           │ dpm_out                   │                    │
 │           ▼                           ▼                    │
 │      output_data                  DRAM Interface           │
-│                                                             │
-│  ┌──────────────────────────────────────────────────────┐  │
 │  │ Global Controller                                    │  │
 │  │  • Monitors: FIFO, credits, processing states       │  │
-│  │  • Controls: sftm_enable, dpm_enable, bypass_mode   │  │
-│  │  • Adaptive bypass on stalls                        │  │
-│  └──────────────────────────────────────────────────────┘  │
-│                                                             │
 └─────────────────────────────────────────────────────────────┘
 ```
-
-### Data Flow
-```
-Input Stream
      │
      ▼
 ┌─────────────────┐
-│  Input Buffer   │ → Collect 4×4 patches
-└────────┬────────┘
-         │
 ┌────────▼────────┐
 │  PreTA Transform│ → B^T × X × B
 └────────┬────────┘
-         │
-┌────────▼────────┐
-│   SCA (4×4)     │ → Y ⊙ G (element-wise)
-└────────┬────────┘
-         │
 ┌────────▼────────┐
 │ PosTA Transform │ → A^T × U × A
-└────────┬────────┘
-         │
-┌────────▼────────┐
-│      QMU        │ → Quality scaling
 └────────┬────────┘
          │
 ┌────────▼────────┐
 │  Group FIFO     │ → Buffering
 └────────┬────────┘
          │
-┌────────▼────────┐       ┌──────────────┐
-│      DPM        │◄──────│  Reference   │
-│  Deformable Conv│       │  Frame Data  │
-└────────┬────────┘       └──────────────┘
          │
          ▼
    Output Stream
-```
-
----
 
 ## Completed Modules
 
-### 1. sca.v - Sparse Computing Array (NEW)
-**What it does**: Performs element-wise multiplication in transform domain (Y ⊙ G)
-
-**Features**:
 - 4×4 array of SCU (Sparse Computing Unit) instances
-- Parallel processing of all transform coefficients
 - Weight and index memory interfaces
 - Pipelined with registered inputs/outputs
 - Configurable dimensions (4×4 for conv, 6×6 for deconv)
@@ -190,20 +147,13 @@ endgenerate
 
 ### 2. sftm.v - Sparse Fast Transform Module (UPGRADED)
 **Before**: Simple counter generating dummy data  
-**After**: Complete Winograd pipeline with mode selection
 
 **Pipeline Stages**:
 1. **Input Buffer**: Collects 4×4 patches from input stream
 2. **PreTA**: Winograd pre-transform (B^T × X × B)
 3. **SCA**: Sparse computing with weights
 4. **PosTA**: Winograd post-transform (A^T × U × A)
-5. **QMU**: Quality modulation
-
-**New Interfaces**:
-```verilog
-input [DATA_W-1:0] input_data        // Streaming input
 input input_valid                     // Input valid
-input conv_mode                       // 1=conv, 0=deconv
 input [1:0] quality_mode             // 0-3 quality levels
 output [WEIGHT_ADDR_W-1:0] weight_addr  // Weight memory address
 input signed [DATA_W-1:0] weight_data[0:3][0:3]  // Weight data
@@ -229,7 +179,6 @@ input signed [DATA_W-1:0] weight_data[0:3][0:3]  // Weight data
 1. **IDLE**: Wait for enable
 2. **READ_FEATURES**: Collect transformed features (4×4)
 3. **READ_OFFSETS**: Collect offset maps (Δx, Δy for 3×3 kernel)
-4. **READ_REF**: Load reference frame pixels
 5. **COMPUTE_DEFORM**: Apply deformable sampling
 6. **OUTPUT**: Write results
 
@@ -548,6 +497,45 @@ vvp vcnpu_sim
 gtkwave vcnpu_integrated.vcd
 ```
 
+### Use Real Video-Derived Stimulus (Optional)
+
+The integrated testbench can optionally load a real 64×64 grayscale frame and derived 4×4 input patches via `.memh` files.
+
+1) Extract a single grayscale frame (example using `ffmpeg`):
+```bash
+ffmpeg -i input.mp4 -vf scale=64:64,format=gray -frames:v 1 -f rawvideo -pix_fmt gray frame64.raw
+```
+
+2) Convert it into `ref.memh` + `patch.memh` (16-bit hex words):
+```bash
+python Prop/tools/frame_to_memh.py --raw frame64.raw --w 64 --h 64 --ref-out ref.memh --patch-out patch.memh
+```
+
+3) Run the Verilator integrated suite and point it at those files:
+```powershell
+powershell -ExecutionPolicy Bypass -File Prop/run_tb.ps1 -RefMemh .\ref.memh -PatchMemh .\patch.memh
+```
+
+Notes:
+- `-RefMemh` drives the TB DRAM model (reference-frame reads).
+- `-PatchMemh` drives the TB input stream (256 patches × 16 values each).
+- The script uses `-ExecutionPolicy Bypass` only for that PowerShell *process* (it does not change system policy).
+
+### Recommended Windows Flow (Verilator)
+
+On Windows, the most reliable flow is the PowerShell runner (it mirrors sources into a no-spaces build directory and builds/runs with MSYS2 Verilator).
+
+```powershell
+powershell -ExecutionPolicy Bypass -File Prop/run_tb.ps1
+```
+
+Optional performance-model knobs (all forwarded as Verilator `-G` parameters):
+- `-SimClkMhz <double>`: sets the *actual simulated clock* (overrides TB `CLK_PERIOD`). Use `-SimClkMhz 400` for 400 MHz.
+- `-PerfTargetClkMhz <double>`: scale cycle counts to a target clock (first-order linear scaling).
+- `-PerfIoCapGbps <double>` + `-PerfIoEff <double>`: cap “realistic” throughput by an external I/O bandwidth model.
+- `-PerfIoBytesPerPatch <double>`: override bytes/patch used by the I/O cap (useful to model full-tile traffic).
+- `-PerfPatchSide <int>`: patch side length used for patch-based FPS projections (default matches TB stimulus: 4).
+
 ### Testbench Coverage
 The provided testbench (`tb_vcnpu_integrated.sv`) includes:
 1. ✅ Weight loading sequence
@@ -612,15 +600,49 @@ Total: ~6500 LUTs + DSPs + 5KB memory
 ```
 
 ### System Throughput
-```
-Clock: 100 MHz
-Cycles per group: ~60 (pipelined)
-Groups per second: 100M / 60 = 1.67M
 
-Frame: 1920×1080 with 16×16 tiles
-Groups per frame: (1920/16) × (1080/16) = 8,160
-Frame rate: 1.67M / 8,160 ≈ 205 FPS
-```
+The integrated testbench reports throughput in **patches/s** (printed as `kpatch/s`). In this TB, a “patch” is `PERF_PATCH_SIDE × PERF_PATCH_SIDE` pixels; by default `PERF_PATCH_SIDE=4` and each patch is streamed as 16 words.
+
+The TB prints two FPS interpretations:
+
+**Patch-based FPS (matches stimulus units)**
+
+Let:
+- `patch_side = PERF_PATCH_SIDE`
+- `patches_per_frame = ceil_div(W, patch_side) * ceil_div(H, patch_side)`
+
+Then:
+- `fps(patch) = patches_per_s / patches_per_frame`
+
+**Tile-based FPS (16×16 “tile” unit of work)**
+
+If you want to interpret performance in terms of `TILE_SIZE × TILE_SIZE` tiles, you must account for how many patches are required per tile:
+
+Let:
+- `tile_side = TILE_SIZE`
+- `tiles_per_frame = ceil_div(W, tile_side) * ceil_div(H, tile_side)`
+- `patches_per_tile = ceil_div(tile_side, patch_side)^2`
+
+Then:
+- `fps(tile) = patches_per_s / (tiles_per_frame * patches_per_tile)`
+
+This correction matters whenever `TILE_SIZE != PERF_PATCH_SIDE`. Example: with `TILE_SIZE=16` and `PERF_PATCH_SIDE=4`, each tile requires `ceil_div(16,4)^2 = 16` patches; omitting this factor inflates tile-based FPS by 16×.
+
+**Scaling and “realistic” cap**
+- `scaled @<MHz>` multiplies measured throughput by `PerfTargetClkMhz / measured_clk_mhz` (first-order only).
+- `realistic @<MHz>` further caps throughput by an I/O model: `min(scaled_patches_per_s, bw_bytes_per_s / bytes_per_patch_used)`.
+- Use `-PerfIoBytesPerPatch` when your regression stimulus under-represents real DRAM traffic (e.g., to model full-tile reads/writes even if outputs are small).
+
+### Interpreting TB Output
+
+Look for lines like:
+- `throughput=... kpatch/s`
+- `frame=... tile=... groups/frame=... patches/tile=... => est_fps(tile)=...`
+- `frame=... patch=... groups/frame=... => est_fps(patch)=...`
+- `scaled @...MHz ... proj(tile)=... proj(patch)=...`
+- `realistic @...MHz (IO cap=... GB/s eff=...) ...`
+
+Note: projections to 1920×1080 use `ceil_div()` for both tiling and patching, so `proj(tile)` and `proj(patch)` can differ slightly due to edge padding (e.g., 1080 is not divisible by 16).
 
 ### Memory Usage
 - **Weight memory**: 4KB (configurable)

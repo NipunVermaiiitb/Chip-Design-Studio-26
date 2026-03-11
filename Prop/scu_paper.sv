@@ -85,39 +85,40 @@ module scu_paper #(
     // next-state image to correctly handle multiple hits to same addr in one cycle
     logic signed [ACC_bits-1:0] accu_next [47:0];
 
-    integer x;
     always_comb begin
-        for (x = 0; x < 48; x = x + 1) begin
-            accu_next[x] = accu[x];
+        integer xi;
+        for (xi = 0; xi < 48; xi = xi + 1) begin
+            accu_next[xi] = accu[xi];
         end
 
         if (clear) begin
-            for (x = 0; x < 48; x = x + 1) begin
-                accu_next[x] = '0;
+            for (xi = 0; xi < 48; xi = xi + 1) begin
+                accu_next[xi] = '0;
             end
         end else if (en) begin
-            for (x = 0; x < 18; x = x + 1) begin
+            for (xi = 0; xi < 18; xi = xi + 1) begin
                 logic [I_bits-1:0] idx_eff;
                 logic [5:0] addr;
                 logic signed [ACC_bits-1:0] pp_ext;
 
-                idx_eff = mode ? {2'b00, indexes[x][3:0]} : indexes[x];
-                addr    = accu_addr(x, idx_eff);
+                idx_eff = mode ? {2'b00, indexes[xi][3:0]} : indexes[xi];
+                addr    = accu_addr(xi, idx_eff);
 
-                pp_ext = {{(ACC_bits-PROD_bits){partial_product[x][PROD_bits-1]}}, partial_product[x]};
+                pp_ext = {{(ACC_bits-PROD_bits){partial_product[xi][PROD_bits-1]}}, partial_product[xi]};
                 accu_next[addr] = accu_next[addr] + pp_ext;
             end
         end
     end
 
     always_ff @(posedge clk or negedge rst_n) begin
+        integer xi;
         if (!rst_n) begin
-            for (x = 0; x < 48; x = x + 1) begin
-                accu[x] <= '0;
+            for (xi = 0; xi < 48; xi = xi + 1) begin
+                accu[xi] <= '0;
             end
         end else begin
-            for (x = 0; x < 48; x = x + 1) begin
-                accu[x] <= accu_next[x];
+            for (xi = 0; xi < 48; xi = xi + 1) begin
+                accu[xi] <= accu_next[xi];
             end
         end
     end

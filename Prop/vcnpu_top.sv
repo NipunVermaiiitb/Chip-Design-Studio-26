@@ -1,4 +1,4 @@
-// vcnpu_top.sv
+// vcnpu_top.v
 // Top-level for VCNPU + Group-Synchronized Forwarding integration
 // Complete integration with SFTM pipeline, DPM deformable conv, smart prefetcher, and advanced controller
 
@@ -187,8 +187,7 @@ wire fifo_full, fifo_empty;
 wire [DATA_W-1:0] fifo_dout;
 wire fifo_dout_valid;
 wire fifo_dout_last;
-wire [4:0] fifo_count_internal;
-wire [3:0] fifo_count;
+wire [7:0] fifo_count_internal;
 
 // Credit system
 wire credit_available;
@@ -198,8 +197,10 @@ wire credit_available;
 wire use_dpm = !conv_mode;
 
 // Group boundary: last word marker from FIFO
-wire fifo_pop_word = fifo_pop && fifo_dout_valid;
-wire group_consumed_pulse = fifo_pop_word && fifo_dout_last;
+// NOTE: group_sync_fifo registers read outputs; rd_data_valid/rd_last reflect
+// the previous cycle's rd_en. Use these registered markers for drain/credit.
+wire fifo_pop_word = fifo_dout_valid;
+wire group_consumed_pulse = fifo_dout_valid && fifo_dout_last;
 
 // DPM signals
 wire dpm_enable;
@@ -216,9 +217,6 @@ wire bypass_mode_en;
 wire controller_error;
 wire controller_busy;
 
-// Extract 4-bit count for controller
-assign fifo_count = fifo_count_internal[3:0];
-
 // Track consumer processing state
 always @(posedge clk or negedge rst_n) begin
     if (!rst_n)
@@ -226,6 +224,7 @@ always @(posedge clk or negedge rst_n) begin
     else
         dpm_processing <= use_dpm ? (dpm_enable && !fifo_empty) : (!fifo_empty);
 end
+
 
 // Output assignments (bypass DPM for RFConv)
 assign output_data  = use_dpm ? dpm_out       : fifo_dout;
@@ -334,7 +333,8 @@ split_prefetcher #(
     .frame_height(frame_height),
     .ref_frame_base_addr(ref_frame_base_addr),
     // Control
-    .group_done(sftm_group_done),
+    // Only deconv/DPM needs reference prefetching.
+    .group_done(use_dpm ? sftm_group_done : 1'b0),
     .group_x(current_group_x),
     .group_y(current_group_y),
     // DRAM interface
@@ -342,6 +342,7 @@ split_prefetcher #(
     .addr(dram_addr),
     .len(dram_len),
     .dram_ack(dram_ack),
+    .dram_data_valid(dram_data_valid),
     // Status
     .busy(prefetch_busy)
 );
@@ -361,6 +362,7 @@ dpm #(
     // Input from FIFO
     .fifo_data(fifo_dout),
     .fifo_data_valid(fifo_dout_valid),
+    .fifo_empty(fifo_empty),
     .fifo_pop(fifo_pop_from_dpm),
     // Reference frame data
     .ref_data(dram_data_in),
@@ -380,7 +382,8 @@ assign fifo_pop = use_dpm ? fifo_pop_from_dpm : fifo_pop_from_bypass;
 global_controller #(
     .GROUP_ROWS(GROUP_ROWS),
     .MAX_CREDITS(DEPTH_GROUPS),
-    .FIFO_DEPTH(32 * DEPTH_GROUPS)
+    .FIFO_DEPTH(32 * DEPTH_GROUPS),
+    .GROUP_WORDS(32)
 ) u_glob (
     .clk(clk),
     .rst_n(rst_n),
@@ -392,7 +395,7 @@ global_controller #(
     .fifo_empty(fifo_empty),
     .credit_available(credit_available),
     .prefetch_busy(prefetch_busy),
-    .fifo_count(fifo_count),
+    .fifo_count(fifo_count_internal),
     .drain_word(fifo_pop_word),
     .drain_last(group_consumed_pulse),
     // Control outputs

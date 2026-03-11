@@ -28,6 +28,7 @@ module dpm #(
     // Input from FIFO (transformed features and offsets)
     input wire [DATA_W-1:0] fifo_data,
     input wire fifo_data_valid,
+    input wire fifo_empty,
     output reg fifo_pop,
     
     // Reference frame data from prefetcher
@@ -69,6 +70,13 @@ reg ra_start_fill;
 reg ra_wr_en;
 reg [REF_ADDR_W-1:0] ra_wr_addr;
 reg [DATA_W-1:0] ra_wr_data;
+
+// Reference capture tracker: since the external DRAM stream has no backpressure,
+// we must not wait until after offsets are fully read to begin filling RA.
+// Start the fill at group start and capture beats whenever ref_data_valid.
+reg ref_active;
+reg [REF_ADDR_W-1:0] ref_wr_addr;
+reg [REF_ADDR_W:0]   ref_cnt;
 
 wire ra_rd_bank_sel;
 wire [DATA_W-1:0] ra_v00_u, ra_v01_u, ra_v10_u, ra_v11_u;
@@ -181,6 +189,10 @@ always @(posedge clk or negedge rst_n) begin
         sb_valid_in <= 0;
         sb_waiting <= 0;
 
+        ref_active <= 1'b0;
+        ref_wr_addr <= 0;
+        ref_cnt <= 0;
+
         // Clear motion-vector tiles
         for (i = 0; i < GROUP_ROWS; i = i + 1)
             for (j = 0; j < GROUP_ROWS; j = j + 1) begin
@@ -193,21 +205,46 @@ always @(posedge clk or negedge rst_n) begin
         sb_valid_in <= 1'b0;
         ra_wr_en <= 1'b0;
         ra_start_fill <= 1'b0;
+        fifo_pop <= 1'b0;
+
+        // Capture reference stream whenever active.
+        if (ref_active && ref_data_valid) begin
+            ra_wr_en <= 1'b1;
+            ra_wr_data <= ref_data;
+            ra_wr_addr <= ref_wr_addr;
+            ref_wr_addr <= ref_wr_addr + 1'b1;
+            ref_cnt <= ref_cnt + 1'b1;
+            if (ref_cnt == (REF_WORDS - 1)) begin
+                ref_active <= 1'b0;
+            end
+        end
         
         case (state)
             IDLE: begin
-                fifo_pop <= 0;
                 cnt <= 0;
                 if (start) begin
                     state <= READ_OFFSETS;
                     cnt <= 0;
+
+                    // Arm reference fill early so we don't miss beats.
+                    ref_active <= 1'b1;
+                    ref_wr_addr <= 0;
+                    ref_cnt <= 0;
+                    ra_start_fill <= 1'b1;
+                    ra_wr_addr <= 0;
                 end
             end
             
             READ_OFFSETS: begin
-                // Read motion vectors dx then dy from FIFO
-                if (fifo_data_valid) begin
+                // group_sync_fifo presents rd_data_valid with a 1-cycle latency
+                // after rd_en (fifo_pop). Drive fifo_pop whenever we still need
+                // offset words and the FIFO is not empty; capture data only
+                // when fifo_data_valid asserts.
+                if ((cnt < (2 * GROUP_ROWS * GROUP_ROWS)) && !fifo_empty) begin
                     fifo_pop <= 1'b1;
+                end
+
+                if (fifo_data_valid) begin
                     if (cnt < (GROUP_ROWS * GROUP_ROWS)) begin
                         offset_x[cnt[3:2]][cnt[1:0]] <= fifo_data;
                     end else begin
@@ -217,33 +254,17 @@ always @(posedge clk or negedge rst_n) begin
                     if (cnt == (2 * GROUP_ROWS * GROUP_ROWS - 1)) begin
                         state <= READ_REF;
                         cnt <= 0;
-                        fifo_pop <= 1'b0;
                     end
-                end else begin
-                    fifo_pop <= 1'b0;
                 end
             end
             
             READ_REF: begin
-                // Read reference pixels (prefetched by split_prefetcher) into RA ping-pong
-                // Start a new fill on entry to this state.
-                if (cnt == 0) begin
-                    ra_start_fill <= 1'b1;
-                    ra_wr_addr <= 0;
-                end
-
-                if (ref_data_valid) begin
-                    ra_wr_en <= 1'b1;
-                    ra_wr_data <= ref_data;
-                    ra_wr_addr <= ra_wr_addr + 1'b1;
-                    cnt <= cnt + 1;
-
-                    if (cnt == (REF_WORDS - 1)) begin
-                        state <= SAMPLE;
-                        cnt <= 0;
-                        sb_waiting <= 1'b0;
-                        pixel_cnt <= 0;
-                    end
+                // Wait for reference capture to complete (stream is captured
+                // opportunistically via ref_active above).
+                if (!ref_active) begin
+                    state <= SAMPLE;
+                    sb_waiting <= 1'b0;
+                    pixel_cnt <= 0;
                 end
             end
 

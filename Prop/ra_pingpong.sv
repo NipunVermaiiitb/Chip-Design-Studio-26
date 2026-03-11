@@ -34,7 +34,10 @@ module ra_pingpong #(
 
     logic cur_wr_bank;
 
-    assign rd_bank_sel = ~cur_wr_bank;
+    // In this integration the DPM fills the RA tile first, then samples it.
+    // Make the read bank track the current write bank so sampling reads the
+    // freshly-filled tile (no extra one-tile pipeline delay required).
+    assign rd_bank_sel = cur_wr_bank;
 
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin

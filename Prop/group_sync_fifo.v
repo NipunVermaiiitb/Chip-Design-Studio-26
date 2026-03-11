@@ -40,6 +40,14 @@ reg [ADDR_W-1:0] wptr;
 reg [ADDR_W-1:0] rptr;
 reg [ADDR_W:0]   count; // up to TOTAL_ROWS
 
+// Group-level admission control
+reg wr_group_valid_q;
+reg wr_group_accepted;
+reg [$clog2(GROUP_WORDS+1)-1:0] wr_group_word_count;
+
+wire space_for_group;
+assign space_for_group = (count <= (TOTAL_ROWS - GROUP_WORDS));
+
 assign full  = (count == TOTAL_ROWS);
 assign empty = (count == 0);
 
@@ -53,16 +61,53 @@ always @(posedge clk or negedge rst_n) begin
         rd_data_valid <= 0;
         rd_last <= 0;
         error <= 0;
+        wr_group_valid_q <= 1'b0;
+        wr_group_accepted <= 1'b0;
+        wr_group_word_count <= '0;
         for (i=0;i<TOTAL_ROWS;i=i+1) begin
             mem[i] <= {DATA_W{1'b0}};
             mem_last[i] <= 1'b0;
         end
     end else begin
+        // Track group boundaries on the write side.
+        // Accept a new group only when there is space for an entire group.
+        if (wr_group_valid && !wr_group_valid_q) begin
+            // Start-of-group pulse
+            if (!bypass_mode && !space_for_group) begin
+                wr_group_accepted <= 1'b0;
+                error <= 1'b1;
+            end else begin
+                wr_group_accepted <= 1'b1;
+                wr_group_word_count <= '0;
+            end
+        end
+        wr_group_valid_q <= wr_group_valid;
+
+        // End-of-group: clear acceptance + word counter
+        if (group_done) begin
+            wr_group_accepted <= 1'b0;
+            wr_group_word_count <= '0;
+        end
+
         // write path
         if (wr_en) begin
-            if (full && !bypass_mode) begin
+            // In normal mode, only accept writes for an accepted group.
+            // In bypass mode, keep legacy behavior (still bounded by physical depth).
+            if (!bypass_mode && !wr_group_accepted) begin
+                // Reject writes outside of a credited group.
+                error <= 1'b1;
+            end else if (full && !bypass_mode) begin
                 error <= 1'b1; // overflow
             end else begin
+                // Guard against a buggy producer writing more than GROUP_WORDS in one group.
+                if (!bypass_mode) begin
+                    if (wr_group_word_count == GROUP_WORDS[$clog2(GROUP_WORDS+1)-1:0]) begin
+                        error <= 1'b1;
+                    end else begin
+                        wr_group_word_count <= wr_group_word_count + 1'b1;
+                    end
+                end
+
                 mem[wptr] <= wr_data;
                 mem_last[wptr] <= group_done;
                 wptr <= wptr + 1;
